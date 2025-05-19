@@ -2,13 +2,13 @@ package beaconclient
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
-
-	"github.com/goccy/go-json"
+	"time"
 )
 
 var (
@@ -31,35 +31,62 @@ func parseBroadcastModeString(s string) (BroadcastMode, bool) {
 	return b, ok
 }
 
-func fetchBeacon(method, url string, payload []byte, dst any, httpClient *http.Client, headers http.Header, ssz bool) (code int, err error) {
+func makeJSONRequest(method, url string, payload any) (*http.Request, error) {
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("could not marshal request: %w", err)
+	}
+	req, err := http.NewRequest(method, url, bytes.NewReader(payloadBytes))
+	if err != nil {
+		return nil, fmt.Errorf("invalid request for %s: %w", url, err)
+	}
+	// Set content-type
+	req.Header.Add("Content-Type", "application/json")
+	return req, nil
+}
+
+func makeSSZRequest(method, url string, payload any) (*http.Request, error) {
+	payloadBytes, ok := payload.([]byte)
+	if !ok {
+		return nil, fmt.Errorf("invalid payload type for SSZ request: %w", ErrInvalidRequestPayload)
+	}
+	req, err := http.NewRequest(method, url, bytes.NewReader(payloadBytes))
+	if err != nil {
+		return nil, fmt.Errorf("invalid request for %s: %w", url, err)
+	}
+	// Set content-type
+	req.Header.Add("Content-Type", "application/octet-stream")
+	return req, nil
+}
+
+func fetchBeacon(method, url string, payload, dst any, timeout *time.Duration, headers http.Header, ssz bool) (code int, err error) {
 	var req *http.Request
 
 	if payload == nil {
 		req, err = http.NewRequest(method, url, nil)
 	} else {
-		req, err = http.NewRequest(method, url, bytes.NewReader(payload))
+		if ssz {
+			req, err = makeSSZRequest(method, url, payload)
+		} else {
+			req, err = makeJSONRequest(method, url, payload)
+		}
 	}
 
 	if err != nil {
 		return 0, fmt.Errorf("invalid request for %s: %w", url, err)
 	}
 
-	if ssz {
-		req.Header.Add("Content-Type", "application/octet-stream")
-	} else {
-		req.Header.Add("Content-Type", "application/json")
-	}
-
 	for k, v := range headers {
 		req.Header.Add(k, v[0])
 	}
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("accept", "application/json")
 
 	client := http.DefaultClient
-	if httpClient != nil {
-		client = httpClient
+	if timeout != nil && timeout.Seconds() > 0 {
+		client = &http.Client{ //nolint:exhaustruct
+			Timeout: *timeout,
+		}
 	}
-
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, fmt.Errorf("client refused for %s: %w", url, err)

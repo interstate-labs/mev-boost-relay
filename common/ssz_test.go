@@ -2,6 +2,8 @@ package common
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
 	"os"
 	"testing"
 
@@ -10,7 +12,6 @@ import (
 	builderSpec "github.com/attestantio/go-builder-client/spec"
 	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/ethereum/go-ethereum/common/hexutil"
-	"github.com/goccy/go-json"
 	"github.com/stretchr/testify/require"
 )
 
@@ -35,7 +36,7 @@ func TestSSZBuilderSubmission(t *testing.T) {
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
 			// json matches marshalled SSZ
-			jsonBytes := LoadGzippedBytes(t, testCase.filepath+".json.gz")
+			jsonBytes := LoadGzippedBytes(t, fmt.Sprintf("%s.json.gz", testCase.filepath))
 
 			submitBlockData := new(VersionedSubmitBlockRequest)
 			err := json.Unmarshal(jsonBytes, &submitBlockData)
@@ -45,7 +46,7 @@ func TestSSZBuilderSubmission(t *testing.T) {
 			marshalledSszBytes, err := submitBlockData.MarshalSSZ()
 			require.NoError(t, err)
 
-			sszBytes := LoadGzippedBytes(t, testCase.filepath+".ssz.gz")
+			sszBytes := LoadGzippedBytes(t, fmt.Sprintf("%s.ssz.gz", testCase.filepath))
 			require.Equal(t, sszBytes, marshalledSszBytes)
 
 			htr, err := submitBlockData.HashTreeRoot()
@@ -62,7 +63,7 @@ func TestSSZBuilderSubmission(t *testing.T) {
 			buffer := new(bytes.Buffer)
 			err = json.Compact(buffer, jsonBytes)
 			require.NoError(t, err)
-			require.JSONEq(t, buffer.String(), string(marshalledJSONBytes))
+			require.Equal(t, buffer.Bytes(), marshalledJSONBytes)
 		})
 	}
 }
@@ -90,7 +91,7 @@ func TestSSZGetHeaderResponse(t *testing.T) {
 			// json -> marshalled ssz -> matches expected ssz
 			payload := new(builderSpec.VersionedSignedBuilderBid)
 
-			jsonBytes, err := os.ReadFile(testCase.filepath + ".json")
+			jsonBytes, err := os.ReadFile(fmt.Sprintf("%s.json", testCase.filepath))
 			require.NoError(t, err)
 
 			err = json.Unmarshal(jsonBytes, &payload)
@@ -108,7 +109,7 @@ func TestSSZGetHeaderResponse(t *testing.T) {
 				require.Fail(t, "unknown version")
 			}
 
-			sszExpectedBytes, err := os.ReadFile(testCase.filepath + ".ssz")
+			sszExpectedBytes, err := os.ReadFile(fmt.Sprintf("%s.ssz", testCase.filepath))
 			require.NoError(t, err)
 			require.Equal(t, sszExpectedBytes, ssz)
 
@@ -146,7 +147,7 @@ func TestSSZGetHeaderResponse(t *testing.T) {
 			buffer := new(bytes.Buffer)
 			err = json.Compact(buffer, jsonBytes)
 			require.NoError(t, err)
-			require.JSONEq(t, buffer.String(), string(marshalledJSONBytes))
+			require.Equal(t, buffer.Bytes(), marshalledJSONBytes)
 		})
 	}
 }
@@ -160,14 +161,14 @@ func BenchmarkDecoding(b *testing.B) {
 
 	payload := new(builderSpec.VersionedSignedBuilderBid)
 	b.Run("capella json", func(b *testing.B) {
-		for range b.N {
+		for i := 0; i < b.N; i++ {
 			err = json.Unmarshal(jsonBytes, &payload)
 			require.NoError(b, err)
 		}
 	})
 	payload.Capella = new(builderApiCapella.SignedBuilderBid)
 	b.Run("capella ssz", func(b *testing.B) {
-		for range b.N {
+		for i := 0; i < b.N; i++ {
 			err = payload.Capella.UnmarshalSSZ(sszBytes)
 			require.NoError(b, err)
 		}
@@ -180,14 +181,14 @@ func BenchmarkDecoding(b *testing.B) {
 	require.NoError(b, err)
 	payload = new(builderSpec.VersionedSignedBuilderBid)
 	b.Run("deneb json", func(b *testing.B) {
-		for range b.N {
+		for i := 0; i < b.N; i++ {
 			err = json.Unmarshal(jsonBytes, &payload)
 			require.NoError(b, err)
 		}
 	})
 	payload.Deneb = new(builderApiDeneb.SignedBuilderBid)
 	b.Run("deneb ssz", func(b *testing.B) {
-		for range b.N {
+		for i := 0; i < b.N; i++ {
 			err = payload.Deneb.UnmarshalSSZ(sszBytes)
 			require.NoError(b, err)
 		}

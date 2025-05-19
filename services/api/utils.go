@@ -1,9 +1,10 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
-	"mime"
 	"net/http"
+	"strings"
 
 	builderApi "github.com/attestantio/go-builder-client/api"
 	"github.com/attestantio/go-eth2-client/spec"
@@ -20,14 +21,11 @@ var (
 	ErrBlockHashMismatch  = errors.New("blockHash mismatch")
 	ErrParentHashMismatch = errors.New("parentHash mismatch")
 
-	ErrUnsupportedPayload   = errors.New("unsupported payload version")
-	ErrNoWithdrawals        = errors.New("no withdrawals")
-	ErrNoDepositRequests    = errors.New("no deposit receipts")
-	ErrNoWithdrawalRequests = errors.New("no execution layer withdrawal requests")
-	ErrPayloadMismatch      = errors.New("beacon-block and payload version mismatch")
-	ErrHeaderHTRMismatch    = errors.New("beacon-block and payload header mismatch")
-	ErrBlobMismatch         = errors.New("beacon-block and payload blob contents mismatch")
-	ErrNotAcceptable        = errors.New("not acceptable")
+	ErrUnsupportedPayload = errors.New("unsupported payload version")
+	ErrNoWithdrawals      = errors.New("no withdrawals")
+	ErrPayloadMismatch    = errors.New("beacon-block and payload version mismatch")
+	ErrHeaderHTRMismatch  = errors.New("beacon-block and payload header mismatch")
+	ErrBlobMismatch       = errors.New("beacon-block and payload blob contents mismatch")
 )
 
 func SanityCheckBuilderBlockSubmission(payload *common.VersionedSubmitBlockRequest) error {
@@ -114,37 +112,6 @@ func EqBlindedBlockContentsToBlockContents(bb *common.VersionedSignedBlindedBeac
 				return errors.Wrap(ErrBlobMismatch, fmt.Sprintf("mismatched KZG commitment at index %d", i))
 			}
 		}
-	case spec.DataVersionElectra:
-		block := bb.Electra.Message
-		bbHeaderHtr, err := block.Body.ExecutionPayloadHeader.HashTreeRoot()
-		if err != nil {
-			return err
-		}
-
-		versionedPayload.Electra = payload.Electra.ExecutionPayload
-		payloadHeader, err := utils.PayloadToPayloadHeader(versionedPayload)
-		if err != nil {
-			return err
-		}
-
-		payloadHeaderHtr, err := payloadHeader.Electra.HashTreeRoot()
-		if err != nil {
-			return err
-		}
-
-		if bbHeaderHtr != payloadHeaderHtr {
-			return ErrHeaderHTRMismatch
-		}
-
-		if len(bb.Electra.Message.Body.BlobKZGCommitments) != len(payload.Electra.BlobsBundle.Commitments) {
-			return errors.Wrap(ErrBlobMismatch, "mismatched number of KZG commitments")
-		}
-
-		for i, commitment := range bb.Electra.Message.Body.BlobKZGCommitments {
-			if commitment != payload.Electra.BlobsBundle.Commitments[i] {
-				return errors.Wrap(ErrBlobMismatch, fmt.Sprintf("mismatched KZG commitment at index %d", i))
-			}
-		}
 	default:
 		return ErrUnsupportedPayload
 	}
@@ -183,23 +150,38 @@ func verifyBlockSignature(block *common.VersionedSignedBlindedBeaconBlock, domai
 	return bls.VerifySignatureBytes(msg[:], sig[:], pubKey[:])
 }
 
-func getPayloadAttributesKey(parentHash string, slot uint64) string {
-	return fmt.Sprintf("%s-%d", parentHash, slot)
+func broadcastToChannels[T any](constraintsConsumers []chan *T, constraint *T) {
+	for _, consumer := range constraintsConsumers {
+		consumer <- constraint
+	}
 }
 
-// getHeaderContentType parses the Content-Type header and returns the media type and parameters.
-// It returns an empty mediaType string and nil parameters if the header is not set or empty.
-func getHeaderContentType(header http.Header) (mediatype string, params map[string]string, err error) {
-	contentType := header.Get(HeaderContentType)
-	if contentType == "" {
-		return "", nil, nil
-	}
-
-	// Parse the content type
-	contentType, params, err = mime.ParseMediaType(contentType)
+func JSONStringify[T any](obj T) string {
+	out, err := json.Marshal(obj)
 	if err != nil {
-		return "", nil, errors.Wrap(err, "failed to parse Content-Type header")
+		return fmt.Sprintf("Error while marshalling: %v", err)
 	}
+	return string(out)
+}
 
-	return contentType, params, nil
+func Find[T any](slice []*T, predicate func(arg *T) bool) *T {
+	for _, item := range slice {
+		if predicate(item) {
+			return item
+		}
+	}
+	return nil
+}
+
+// EmitBoltDemoEvent sends a message to the web demo backend to log an event.
+// This is only used for demo purposes and should be removed in production.
+func EmitBoltDemoEvent(message string) {
+	event := strings.NewReader(fmt.Sprintf("{ \"message\": \"BOLT-RELAY: %s\"}", message))
+	eventRes, err := http.Post("http://host.docker.internal:3001/events", "application/json", event)
+	if err != nil {
+		fmt.Printf("Failed to send web demo event: %v", err)
+	}
+	if eventRes != nil {
+		defer eventRes.Body.Close()
+	}
 }

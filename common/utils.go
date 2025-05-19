@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,21 +17,19 @@ import (
 	builderApi "github.com/attestantio/go-builder-client/api"
 	builderApiDeneb "github.com/attestantio/go-builder-client/api/deneb"
 	"github.com/attestantio/go-eth2-client/spec"
+	"github.com/attestantio/go-eth2-client/spec/deneb"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
 	ethcommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/flashbots/go-boost-utils/ssz"
 	"github.com/flashbots/go-boost-utils/types"
-	"github.com/goccy/go-json"
 	"github.com/holiman/uint256"
 )
 
 var (
-	ErrInvalidForkVersion         = errors.New("invalid fork version")
-	ErrHTTPErrorResponse          = errors.New("got an HTTP error response")
-	ErrIncorrectLength            = errors.New("incorrect length")
-	ErrMissingEthConsensusVersion = errors.New("missing eth-consensus-version")
-	ErrInvalidContentType         = errors.New("invalid content type")
+	ErrInvalidForkVersion = errors.New("invalid fork version")
+	ErrHTTPErrorResponse  = errors.New("got an HTTP error response")
+	ErrIncorrectLength    = errors.New("incorrect length")
 )
 
 // SlotPos returns the slot's position in the epoch (1-based, i.e. 1..32)
@@ -228,29 +227,16 @@ func GetBlockSubmissionInfo(submission *VersionedSubmitBlockRequest) (*BlockSubm
 	if err != nil {
 		return nil, err
 	}
-	blobs, err := submission.Blobs()
-	if submission.Version >= spec.DataVersionDeneb && err != nil {
-		return nil, err
-	}
-	blobGasUsed, err := submission.BlobGasUsed()
-	if submission.Version >= spec.DataVersionDeneb && err != nil {
-		return nil, err
-	}
-	excessBlobGas, err := submission.ExcessBlobGas()
-	if submission.Version >= spec.DataVersionDeneb && err != nil {
-		return nil, err
-	}
-	depositRequests, err := submission.DepositRequests()
-	if submission.Version >= spec.DataVersionElectra && err != nil {
-		return nil, err
-	}
-	withdrawalRequests, err := submission.WithdrawalRequests()
-	if submission.Version >= spec.DataVersionElectra && err != nil {
-		return nil, err
-	}
-	consolidationRequests, err := submission.ConsolidationRequests()
-	if submission.Version >= spec.DataVersionElectra && err != nil {
-		return nil, err
+	// TODO (deneb): after deneb fork error if no blob fields
+	var (
+		blobs         []deneb.Blob
+		blobGasUsed   uint64
+		excessBlobGas uint64
+	)
+	if submission.Version == spec.DataVersionDeneb {
+		blobs = submission.Deneb.BlobsBundle.Blobs
+		blobGasUsed = submission.Deneb.ExecutionPayload.BlobGasUsed
+		excessBlobGas = submission.Deneb.ExecutionPayload.ExcessBlobGas
 	}
 	return &BlockSubmissionInfo{
 		BidTrace:                   bidTrace,
@@ -267,9 +253,6 @@ func GetBlockSubmissionInfo(submission *VersionedSubmitBlockRequest) (*BlockSubm
 		Blobs:                      blobs,
 		BlobGasUsed:                blobGasUsed,
 		ExcessBlobGas:              excessBlobGas,
-		DepositRequests:            depositRequests,
-		WithdrawalRequests:         withdrawalRequests,
-		ConsolidationRequests:      consolidationRequests,
 	}, nil
 }
 
@@ -288,16 +271,16 @@ func GetBlockSubmissionExecutionPayload(submission *VersionedSubmitBlockRequest)
 				BlobsBundle:      submission.Deneb.BlobsBundle,
 			},
 		}, nil
-	case spec.DataVersionElectra:
-		return &builderApi.VersionedSubmitBlindedBlockResponse{
-			Version: spec.DataVersionElectra,
-			Electra: &builderApiDeneb.ExecutionPayloadAndBlobsBundle{
-				ExecutionPayload: submission.Electra.ExecutionPayload,
-				BlobsBundle:      submission.Electra.BlobsBundle,
-			},
-		}, nil
 	case spec.DataVersionUnknown, spec.DataVersionPhase0, spec.DataVersionAltair, spec.DataVersionBellatrix:
 		return nil, ErrInvalidForkVersion
 	}
 	return nil, ErrEmptyPayload
+}
+
+func JSONStringify(v interface{}) string {
+	out, err := json.Marshal(v)
+	if err != nil {
+		return err.Error()
+	}
+	return string(out)
 }

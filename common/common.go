@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/flashbots/go-utils/cli"
+	"github.com/thedevbirb/flashbots-go-utils/cli"
 )
 
 var (
@@ -48,19 +48,6 @@ type Profile struct {
 	Simulation  uint64
 	RedisUpdate uint64
 	Total       uint64
-
-	// Redis profiling
-	RedisSavePayload  uint64
-	RedisUpdateTopBid uint64
-	RedisUpdateFloor  uint64
-
-	// Attributes
-	IsGzip            bool
-	ContentType       string
-	AboveFloorBid     bool
-	SimulationSuccess bool
-	WasBidSaved       bool
-	Optimistic        bool
 }
 
 func (p *Profile) String() string {

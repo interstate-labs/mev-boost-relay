@@ -1,6 +1,7 @@
 package common
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os"
@@ -21,7 +22,7 @@ import (
 func TestMakePostRequest(t *testing.T) {
 	// Test errors
 	var x chan bool
-	resp, err := makeRequest(t.Context(), *http.DefaultClient, http.MethodGet, "", x)
+	resp, err := makeRequest(context.Background(), *http.DefaultClient, http.MethodGet, "", x)
 	require.Error(t, err)
 	require.Nil(t, resp)
 

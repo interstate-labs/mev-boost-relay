@@ -2,16 +2,12 @@ package database
 
 import (
 	"database/sql"
-	"errors"
-	"math"
 	"strconv"
 	"time"
 
 	builderApiV1 "github.com/attestantio/go-builder-client/api/v1"
 	"github.com/flashbots/go-boost-utils/utils"
 )
-
-var errTimestampOverflow = errors.New("timestamp overflow")
 
 func NewNullInt64(i int64) sql.NullInt64 {
 	return sql.NullInt64{
@@ -82,10 +78,6 @@ func (reg ValidatorRegistrationEntry) ToSignedValidatorRegistration() (*builderA
 		return nil, err
 	}
 
-	if reg.Timestamp > uint64(math.MaxInt64) {
-		return nil, errTimestampOverflow
-	}
-
 	return &builderApiV1.SignedValidatorRegistration{
 		Message: &builderApiV1.ValidatorRegistration{
 			Pubkey:       pubkey,
@@ -101,7 +93,7 @@ func SignedValidatorRegistrationToEntry(valReg builderApiV1.SignedValidatorRegis
 	return ValidatorRegistrationEntry{
 		Pubkey:       valReg.Message.Pubkey.String(),
 		FeeRecipient: valReg.Message.FeeRecipient.String(),
-		Timestamp:    uint64(valReg.Message.Timestamp.Unix()), //nolint:gosec
+		Timestamp:    uint64(valReg.Message.Timestamp.Unix()),
 		GasLimit:     valReg.Message.GasLimit,
 		Signature:    valReg.Signature.String(),
 	}
@@ -117,6 +109,9 @@ type ExecutionPayloadEntry struct {
 
 	Version string `db:"version"`
 	Payload string `db:"payload"`
+
+	// BOLT: merkle proofs of inclusion
+	Proofs string `db:"proofs"`
 }
 
 var ExecutionPayloadEntryCSVHeader = []string{"id", "inserted_at", "slot", "proposer_pubkey", "block_hash", "version", "payload"}
@@ -143,11 +138,10 @@ type BuilderBlockSubmissionEntry struct {
 	ExecutionPayloadID sql.NullInt64 `db:"execution_payload_id"`
 
 	// Sim Result
-	WasSimulated bool           `db:"was_simulated"`
-	SimSuccess   bool           `db:"sim_success"`
-	SimError     string         `db:"sim_error"`
-	SimReqError  string         `db:"sim_req_error"`
-	BlockValue   sql.NullString `db:"block_value"`
+	WasSimulated bool   `db:"was_simulated"`
+	SimSuccess   bool   `db:"sim_success"`
+	SimError     string `db:"sim_error"`
+	SimReqError  string `db:"sim_req_error"`
 
 	// BidTrace data
 	Signature string `db:"signature"`
@@ -177,6 +171,8 @@ type BuilderBlockSubmissionEntry struct {
 	RedisUpdateDuration  uint64 `db:"redis_update_duration"`
 	TotalDuration        uint64 `db:"total_duration"`
 	OptimisticSubmission bool   `db:"optimistic_submission"`
+	// BOLT: merkle inclusion proofs
+	Preconfirmations string `db:"preconfirmations"`
 }
 
 type DeliveredPayloadEntry struct {

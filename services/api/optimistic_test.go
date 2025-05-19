@@ -1,7 +1,9 @@
 package api
 
 import (
-	"errors"
+	"context"
+	"encoding/json"
+	"fmt"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -21,7 +23,6 @@ import (
 	"github.com/flashbots/mev-boost-relay/common"
 	"github.com/flashbots/mev-boost-relay/database"
 	"github.com/flashbots/mev-boost-relay/datastore"
-	"github.com/goccy/go-json"
 	"github.com/holiman/uint256"
 	"github.com/stretchr/testify/require"
 )
@@ -38,7 +39,7 @@ const (
 
 var (
 	feeRecipient = bellatrix.ExecutionAddress{0x02}
-	errFake      = errors.New("foo error")
+	errFake      = fmt.Errorf("foo error")
 )
 
 func getTestBidTrace(pubkey phase0.BLSPubKey, value, slot uint64) *common.BidTraceV2WithBlobFields {
@@ -89,7 +90,7 @@ func startTestBackend(t *testing.T) (*phase0.BLSPubKey, *bls.SecretKey, *testBac
 		},
 	}
 	backend.relay.opts.BlockBuilderAPI = true
-	backend.relay.beaconClient = beaconclient.NewMockMultiBeaconClient()
+	backend.relay.beaconClient = &beaconclient.MockMultiBeaconClient{}
 	backend.relay.blockSimRateLimiter = &MockBlockSimulationRateLimiter{}
 	backend.relay.blockBuildersCache = map[string]*blockBuilderCacheEntry{
 		pkStr: {
@@ -137,7 +138,7 @@ func runOptimisticBlockSubmission(t *testing.T, opts blockRequestOpts, simErr er
 	}
 
 	req := common.TestBuilderSubmitBlockRequest(opts.secretkey, getTestBidTrace(opts.pubkey, opts.blockValue, opts.slot), opts.version)
-	rr := backend.request(http.MethodPost, pathSubmitNewBlock, req)
+	rr := backend.request(http.MethodPost, pathSubmitNewBlock, &req)
 
 	// Let updates happen async.
 	time.Sleep(100 * time.Millisecond)
@@ -165,12 +166,12 @@ func TestSimulateBlock(t *testing.T) {
 		{
 			description:     "block_already_known_capella",
 			version:         spec.DataVersionCapella,
-			simulationError: errors.New(ErrBlockAlreadyKnown), //nolint:goerr113
+			simulationError: fmt.Errorf(ErrBlockAlreadyKnown), //nolint:goerr113
 		},
 		{
 			description:     "missing_trie_node_capella",
 			version:         spec.DataVersionCapella,
-			simulationError: errors.New(ErrMissingTrieNode + "23e21f94cd97b3b27ae5c758277639dd387a6e3da5923c5485f24ec6c71e16b8 (path ) <nil>"), //nolint:goerr113
+			simulationError: fmt.Errorf(ErrMissingTrieNode + "23e21f94cd97b3b27ae5c758277639dd387a6e3da5923c5485f24ec6c71e16b8 (path ) <nil>"), //nolint:goerr113
 		},
 		{
 			description: "success_deneb",
@@ -185,12 +186,12 @@ func TestSimulateBlock(t *testing.T) {
 		{
 			description:     "block_already_known_deneb",
 			version:         spec.DataVersionDeneb,
-			simulationError: errors.New(ErrBlockAlreadyKnown), //nolint:goerr113
+			simulationError: fmt.Errorf(ErrBlockAlreadyKnown), //nolint:goerr113
 		},
 		{
 			description:     "missing_trie_node_deneb",
 			version:         spec.DataVersionDeneb,
-			simulationError: errors.New(ErrMissingTrieNode + "23e21f94cd97b3b27ae5c758277639dd387a6e3da5923c5485f24ec6c71e16b8 (path ) <nil>"), //nolint:goerr113
+			simulationError: fmt.Errorf(ErrMissingTrieNode + "23e21f94cd97b3b27ae5c758277639dd387a6e3da5923c5485f24ec6c71e16b8 (path ) <nil>"), //nolint:goerr113
 		},
 	}
 	for _, tc := range cases {
@@ -199,7 +200,7 @@ func TestSimulateBlock(t *testing.T) {
 			backend.relay.blockSimRateLimiter = &MockBlockSimulationRateLimiter{
 				simulationError: tc.simulationError,
 			}
-			_, _, simErr := backend.relay.simulateBlock(t.Context(), blockSimOptions{
+			_, simErr := backend.relay.simulateBlock(context.Background(), blockSimOptions{
 				isHighPrio: true,
 				log:        backend.relay.log,
 				builder: &blockBuilderCacheEntry{
@@ -372,7 +373,7 @@ func TestBuilderApiSubmitNewBlockOptimistic(t *testing.T) {
 		wantStatus      common.BuilderStatus
 		simulationError error
 		expectDemotion  bool
-		httpCode        int
+		httpCode        uint64
 		blockValue      uint64
 		slot            uint64
 		version         spec.DataVersion
@@ -463,14 +464,13 @@ func TestBuilderApiSubmitNewBlockOptimistic(t *testing.T) {
 			backend.relay.optimisticSlot.Store(tc.slot)
 			backend.relay.capellaEpoch = 1
 			backend.relay.denebEpoch = 2
-			backend.relay.electraEpoch = 3
 			backend.relay.proposerDutiesMap[tc.slot] = backend.relay.proposerDutiesMap[slot]
 
 			randaoHash, err := utils.HexToHash(randao)
 			require.NoError(t, err)
 			withRoot, err := ComputeWithdrawalsRoot([]*capella.Withdrawal{})
 			require.NoError(t, err)
-			backend.relay.payloadAttributes[getPayloadAttributesKey(emptyHash, tc.slot)] = payloadAttributesHelper{
+			backend.relay.payloadAttributes[emptyHash] = payloadAttributesHelper{
 				slot:            tc.slot,
 				withdrawalsRoot: withRoot,
 				payloadAttributes: beaconclient.PayloadAttributes{
@@ -488,7 +488,7 @@ func TestBuilderApiSubmitNewBlockOptimistic(t *testing.T) {
 			}, tc.simulationError, backend)
 
 			// Check http code.
-			require.EqualValues(t, tc.httpCode, rr.Code)
+			require.Equal(t, uint64(rr.Code), tc.httpCode)
 
 			// Check status in db.
 			builder, err := backend.relay.db.GetBlockBuilderByPubkey(pkStr)
@@ -499,7 +499,7 @@ func TestBuilderApiSubmitNewBlockOptimistic(t *testing.T) {
 			// Check demotion status is set to expected and refund is false.
 			mockDB, ok := backend.relay.db.(*database.MockDB)
 			require.True(t, ok)
-			require.Equal(t, tc.expectDemotion, mockDB.Demotions[pkStr])
+			require.Equal(t, mockDB.Demotions[pkStr], tc.expectDemotion)
 			require.False(t, mockDB.Refunds[pkStr])
 		})
 	}

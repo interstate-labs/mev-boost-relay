@@ -16,7 +16,7 @@ import (
 )
 
 var (
-	gasLimit     = uint64(30000000)
+	gasLimit     = 30000000
 	feeRecipient = "0xdb65fEd33dc262Fe09D9a2Ba8F80b329BA25f941"
 	timestamp    = int64(1606824043)
 )
@@ -39,7 +39,7 @@ func main() {
 
 	// Fill in validator registration details
 	validatorRegistration := builderApiV1.ValidatorRegistration{ //nolint:exhaustruct
-		GasLimit:  gasLimit,
+		GasLimit:  uint64(gasLimit),
 		Timestamp: time.Unix(timestamp, 0),
 	}
 

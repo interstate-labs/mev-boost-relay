@@ -1,6 +1,7 @@
 package beaconclient
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -9,32 +10,26 @@ import (
 
 	"github.com/attestantio/go-eth2-client/spec/capella"
 	"github.com/flashbots/mev-boost-relay/common"
-	"github.com/goccy/go-json"
 	"github.com/r3labs/sse/v2"
 	"github.com/sirupsen/logrus"
 )
 
 type ProdBeaconInstance struct {
-	log              *logrus.Entry
-	beaconURI        string
-	beaconPublishURI string
+	log       *logrus.Entry
+	beaconURI string
 
 	// feature flags
 	ffUseV1PublishBlockEndpoint  bool
 	ffUseSSZEncodingPublishBlock bool
-
-	// http clients
-	publishingClient *http.Client
 }
 
-func NewProdBeaconInstance(log *logrus.Entry, beaconURI, beaconPublishURI string) *ProdBeaconInstance {
+func NewProdBeaconInstance(log *logrus.Entry, beaconURI string) *ProdBeaconInstance {
 	_log := log.WithFields(logrus.Fields{
-		"component":        "beaconInstance",
-		"beaconURI":        beaconURI,
-		"beaconPublishURI": beaconPublishURI,
+		"component": "beaconInstance",
+		"beaconURI": beaconURI,
 	})
 
-	client := &ProdBeaconInstance{_log, beaconURI, beaconPublishURI, false, false, &http.Client{}}
+	client := &ProdBeaconInstance{_log, beaconURI, false, false}
 
 	// feature flags
 	if os.Getenv("USE_V1_PUBLISH_BLOCK_ENDPOINT") != "" {
@@ -83,7 +78,7 @@ type PayloadAttributes struct {
 }
 
 func (c *ProdBeaconInstance) SubscribeToHeadEvents(slotC chan HeadEventData) {
-	eventsURL := c.beaconURI + "/eth/v1/events?topics=head"
+	eventsURL := fmt.Sprintf("%s/eth/v1/events?topics=head", c.beaconURI)
 	log := c.log.WithField("url", eventsURL)
 	log.Info("subscribing to head events")
 
@@ -109,7 +104,7 @@ func (c *ProdBeaconInstance) SubscribeToHeadEvents(slotC chan HeadEventData) {
 }
 
 func (c *ProdBeaconInstance) SubscribeToPayloadAttributesEvents(payloadAttributesC chan PayloadAttributesEvent) {
-	eventsURL := c.beaconURI + "/eth/v1/events?topics=payload_attributes"
+	eventsURL := fmt.Sprintf("%s/eth/v1/events?topics=payload_attributes", c.beaconURI)
 	log := c.log.WithField("url", eventsURL)
 	log.Info("subscribing to payload_attributes events")
 
@@ -135,27 +130,27 @@ func (c *ProdBeaconInstance) SubscribeToPayloadAttributesEvents(payloadAttribute
 }
 
 type GetStateValidatorsResponse struct {
-	// ExecutionOptimistic bool `json:"execution_optimistic"`
-	// Finalized           bool `json:"finalized"`
-	Data []ValidatorResponseEntry
+	ExecutionOptimistic bool `json:"execution_optimistic"`
+	Finalized           bool `json:"finalized"`
+	Data                []ValidatorResponseEntry
 }
 
 type ValidatorResponseEntry struct {
-	Index uint64 `json:"index,string"` // Index of validator in validator registry.
-	// Balance   string                         `json:"balance"`      // Current validator balance in gwei.
-	// Status    string                         `json:"status"`
+	Index     uint64                         `json:"index,string"` // Index of validator in validator registry.
+	Balance   string                         `json:"balance"`      // Current validator balance in gwei.
+	Status    string                         `json:"status"`
 	Validator ValidatorResponseValidatorData `json:"validator"`
 }
 
 type ValidatorResponseValidatorData struct {
-	Pubkey string `json:"pubkey"`
-	// WithdrawalCredentials string `json:"withdrawal_credentials"`
-	// EffectiveBalance      string `json:"effective_balance"`
-	// Slashed               bool   `json:"slashed"`
-	// ActivationEligibility uint64 `json:"activation_eligibility_epoch,string"`
-	// ActivationEpoch       uint64 `json:"activation_epoch,string"`
-	// ExitEpoch             uint64 `json:"exit_epoch,string"`
-	// WithdrawableEpoch     uint64 `json:"withdrawable_epoch,string"`
+	Pubkey                string `json:"pubkey"`
+	WithdrawalCredentials string `json:"withdrawal_credentials"`
+	EffectiveBalance      string `json:"effective_balance"`
+	Slashed               bool   `json:"slashed"`
+	ActivationEligibility uint64 `json:"activation_eligibility_epoch,string"`
+	ActivationEpoch       uint64 `json:"activation_epoch,string"`
+	ExitEpoch             uint64 `json:"exit_epoch,string"`
+	WithdrawableEpoch     uint64 `json:"withdrawable_epoch,string"`
 }
 
 // GetStateValidators loads all active and pending validators
@@ -184,7 +179,7 @@ func (c *ProdBeaconInstance) SyncStatus() (*SyncStatusPayloadData, error) {
 	uri := c.beaconURI + "/eth/v1/node/syncing"
 	timeout := 5 * time.Second
 	resp := new(SyncStatusPayload)
-	_, err := fetchBeacon(http.MethodGet, uri, nil, resp, &http.Client{Timeout: timeout}, http.Header{}, false)
+	_, err := fetchBeacon(http.MethodGet, uri, nil, resp, &timeout, http.Header{}, false)
 	if err != nil {
 		return nil, err
 	}
@@ -235,7 +230,7 @@ type GetHeaderResponseMessage struct {
 
 // GetHeader returns the latest header - https://ethereum.github.io/beacon-APIs/#/Beacon/getBlockHeader
 func (c *ProdBeaconInstance) GetHeader() (*GetHeaderResponse, error) {
-	uri := c.beaconURI + "/eth/v1/beacon/headers/head"
+	uri := fmt.Sprintf("%s/eth/v1/beacon/headers/head", c.beaconURI)
 	resp := new(GetHeaderResponse)
 	_, err := fetchBeacon(http.MethodGet, uri, nil, resp, nil, http.Header{}, false)
 	return resp, err
@@ -253,50 +248,49 @@ func (c *ProdBeaconInstance) GetURI() string {
 	return c.beaconURI
 }
 
-func (c *ProdBeaconInstance) GetPublishURI() string {
-	return c.beaconPublishURI
-}
-
 func (c *ProdBeaconInstance) PublishBlock(block *common.VersionedSignedProposal, broadcastMode BroadcastMode) (code int, err error) {
 	var uri string
 	if c.ffUseV1PublishBlockEndpoint {
-		uri = c.beaconPublishURI + "/eth/v1/beacon/blocks"
+		uri = fmt.Sprintf("%s/eth/v1/beacon/blocks", c.beaconURI)
 	} else {
-		uri = fmt.Sprintf("%s/eth/v2/beacon/blocks?broadcast_validation=%s", c.beaconPublishURI, broadcastMode)
+		uri = fmt.Sprintf("%s/eth/v2/beacon/blocks?broadcast_validation=%s", c.beaconURI, broadcastMode)
 	}
 	headers := http.Header{}
 	headers.Add("Eth-Consensus-Version", strings.ToLower(block.Version.String())) // optional in v1, required in v2
 
-	slot, err := block.Slot()
-	if err != nil {
-		slot = 0
-	}
+	// FIXME: using SSZ fails for now, let's skip this and just use fetchBeacon directly
+	// slot, err := block.Slot()
+	// if err != nil {
+	// 	slot = 0
+	// }
+	//
+	// var payloadBytes []byte
+	// useSSZ := c.ffUseSSZEncodingPublishBlock
+	// log := c.log
+	// encodeStartTime := time.Now().UTC()
+	// if useSSZ {
+	// 	log = log.WithField("publishContentType", "ssz")
+	// 	payloadBytes, err = block.MarshalSSZ()
+	// } else {
+	// 	log = log.WithField("publishContentType", "json")
+	// 	payloadBytes, err = json.Marshal(block)
+	// }
+	// if err != nil {
+	// 	return 0, fmt.Errorf("could not marshal request: %w", err)
+	// }
+	// publishingStartTime := time.Now().UTC()
+	// encodeDurationMs := publishingStartTime.Sub(encodeStartTime).Milliseconds()
+	// code, err = fetchBeacon(http.MethodPost, uri, payloadBytes, nil, nil, headers, useSSZ)
+	// publishDurationMs := time.Now().UTC().Sub(publishingStartTime).Milliseconds()
+	// log.WithFields(logrus.Fields{
+	// 	"slot":              slot,
+	// 	"encodeDurationMs":  encodeDurationMs,
+	// 	"publishDurationMs": publishDurationMs,
+	// 	"payloadBytes":      len(payloadBytes),
+	// }).Info("finished publish block request")
+	// return code, err
 
-	var payloadBytes []byte
-	useSSZ := c.ffUseSSZEncodingPublishBlock
-	log := c.log
-	encodeStartTime := time.Now().UTC()
-	if useSSZ {
-		log = log.WithField("publishContentType", "ssz")
-		payloadBytes, err = block.MarshalSSZ()
-	} else {
-		log = log.WithField("publishContentType", "json")
-		payloadBytes, err = json.Marshal(block)
-	}
-	if err != nil {
-		return 0, fmt.Errorf("could not marshal request: %w", err)
-	}
-	publishingStartTime := time.Now().UTC()
-	encodeDurationMs := publishingStartTime.Sub(encodeStartTime).Milliseconds()
-	code, err = fetchBeacon(http.MethodPost, uri, payloadBytes, nil, c.publishingClient, headers, useSSZ)
-	publishDurationMs := time.Now().UTC().Sub(publishingStartTime).Milliseconds()
-	log.WithFields(logrus.Fields{
-		"slot":              slot,
-		"encodeDurationMs":  encodeDurationMs,
-		"publishDurationMs": publishDurationMs,
-		"payloadBytes":      len(payloadBytes),
-	}).Info("finished publish block request")
-	return code, err
+	return fetchBeacon(http.MethodPost, uri, block, nil, nil, headers, false)
 }
 
 type GetGenesisResponse struct {
@@ -311,7 +305,7 @@ type GetGenesisResponseData struct {
 
 // GetGenesis returns the genesis info - https://ethereum.github.io/beacon-APIs/#/Beacon/getGenesis
 func (c *ProdBeaconInstance) GetGenesis() (*GetGenesisResponse, error) {
-	uri := c.beaconURI + "/eth/v1/beacon/genesis"
+	uri := fmt.Sprintf("%s/eth/v1/beacon/genesis", c.beaconURI)
 	resp := new(GetGenesisResponse)
 	_, err := fetchBeacon(http.MethodGet, uri, nil, resp, nil, http.Header{}, false)
 	return resp, err
@@ -328,7 +322,7 @@ type GetSpecResponse struct {
 
 // GetSpec - https://ethereum.github.io/beacon-APIs/#/Config/getSpec
 func (c *ProdBeaconInstance) GetSpec() (spec *GetSpecResponse, err error) {
-	uri := c.beaconURI + "/eth/v1/config/spec"
+	uri := fmt.Sprintf("%s/eth/v1/config/spec", c.beaconURI)
 	resp := new(GetSpecResponse)
 	_, err = fetchBeacon(http.MethodGet, uri, nil, resp, nil, http.Header{}, false)
 	return resp, err
@@ -344,7 +338,7 @@ type GetForkScheduleResponse struct {
 
 // GetForkSchedule - https://ethereum.github.io/beacon-APIs/#/Config/getForkSchedule
 func (c *ProdBeaconInstance) GetForkSchedule() (spec *GetForkScheduleResponse, err error) {
-	uri := c.beaconURI + "/eth/v1/config/fork_schedule"
+	uri := fmt.Sprintf("%s/eth/v1/config/fork_schedule", c.beaconURI)
 	resp := new(GetForkScheduleResponse)
 	_, err = fetchBeacon(http.MethodGet, uri, nil, resp, nil, http.Header{}, false)
 	return resp, err

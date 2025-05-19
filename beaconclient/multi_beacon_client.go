@@ -55,7 +55,6 @@ type IBeaconInstance interface {
 	GetStateValidators(stateID string) (*GetStateValidatorsResponse, error)
 	GetProposerDuties(epoch uint64) (*ProposerDutiesResponse, error)
 	GetURI() string
-	GetPublishURI() string
 	PublishBlock(block *common.VersionedSignedProposal, broadcastMode BroadcastMode) (code int, err error)
 	GetGenesis() (*GetGenesisResponse, error)
 	GetSpec() (spec *GetSpecResponse, err error)
@@ -237,7 +236,7 @@ func (c *MultiBeaconClient) beaconInstancesByLastResponse() []IBeaconInstance {
 func (c *MultiBeaconClient) beaconInstancesByLeastUsed() []IBeaconInstance {
 	beaconInstances := c.beaconInstancesByLastResponse()
 	instances := make([]IBeaconInstance, len(c.beaconInstances))
-	for i := range beaconInstances {
+	for i := 0; i < len(beaconInstances); i++ {
 		instances[i] = beaconInstances[len(beaconInstances)-i-1]
 	}
 	return instances
@@ -272,7 +271,7 @@ func (c *MultiBeaconClient) PublishBlock(block *common.VersionedSignedProposal) 
 	resChans := make(chan publishResp, len(clients))
 
 	for i, client := range clients {
-		log := log.WithField("uri", client.GetPublishURI())
+		log := log.WithField("uri", client.GetURI())
 		log.Debug("publishing block")
 		go func(index int, client IBeaconInstance) {
 			code, err := client.PublishBlock(block, c.broadcastMode)
@@ -285,9 +284,9 @@ func (c *MultiBeaconClient) PublishBlock(block *common.VersionedSignedProposal) 
 	}
 
 	var lastErrPublishResp publishResp
-	for range clients {
+	for i := 0; i < len(clients); i++ {
 		res := <-resChans
-		log = log.WithField("beacon", clients[res.index].GetPublishURI())
+		log = log.WithField("beacon", clients[res.index].GetURI())
 		if res.err != nil {
 			log.WithField("statusCode", res.code).WithError(res.err).Warn("failed to publish block")
 			lastErrPublishResp = res

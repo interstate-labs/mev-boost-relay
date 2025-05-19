@@ -2,6 +2,7 @@ package datastore
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -11,14 +12,13 @@ import (
 
 	builderApi "github.com/attestantio/go-builder-client/api"
 	builderApiDeneb "github.com/attestantio/go-builder-client/api/deneb"
-	builderApiV1 "github.com/attestantio/go-builder-client/api/v1"
 	builderSpec "github.com/attestantio/go-builder-client/spec"
 	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/capella"
-	"github.com/flashbots/go-utils/cli"
 	"github.com/flashbots/mev-boost-relay/common"
-	"github.com/goccy/go-json"
-	"github.com/redis/go-redis/v9"
+	"github.com/go-redis/redis/v9"
+	"github.com/sirupsen/logrus"
+	"github.com/thedevbirb/flashbots-go-utils/cli"
 )
 
 var (
@@ -81,12 +81,13 @@ func connectRedis(redisURI string) (*redis.Client, error) {
 type RedisCache struct {
 	client         *redis.Client
 	readonlyClient *redis.Client
+	boltLog        *logrus.Entry
 
 	// prefixes (keys generated with a function)
 	prefixGetHeaderResponse           string
 	prefixExecPayloadCapella          string
 	prefixPayloadContentsDeneb        string
-	prefixPayloadContentsElectra      string
+	prefixInclusionProof              string
 	prefixBidTrace                    string
 	prefixBlockBuilderLatestBids      string // latest bid for a given slot
 	prefixBlockBuilderLatestBidsValue string // value of latest bid for a given slot
@@ -96,7 +97,7 @@ type RedisCache struct {
 	prefixFloorBidValue               string
 
 	// keys
-	keyValidatorRegistrationData string
+	keyValidatorRegistrationTimestamp string
 
 	keyRelayConfig        string
 	keyStats              string
@@ -123,12 +124,13 @@ func NewRedisCache(prefix, redisURI, readonlyURI string) (*RedisCache, error) {
 	return &RedisCache{
 		client:         client,
 		readonlyClient: roClient,
+		boltLog:        common.NewBoltLogger("REDIS"),
 
-		prefixGetHeaderResponse:      fmt.Sprintf("%s/%s:cache-gethead-response", redisPrefix, prefix),
-		prefixExecPayloadCapella:     fmt.Sprintf("%s/%s:cache-execpayload-capella", redisPrefix, prefix),
-		prefixPayloadContentsDeneb:   fmt.Sprintf("%s/%s:cache-payloadcontents-deneb", redisPrefix, prefix),
-		prefixPayloadContentsElectra: fmt.Sprintf("%s/%s:cache-payloadcontents-electra", redisPrefix, prefix),
-		prefixBidTrace:               fmt.Sprintf("%s/%s:cache-bid-trace", redisPrefix, prefix),
+		prefixGetHeaderResponse:    fmt.Sprintf("%s/%s:cache-gethead-response", redisPrefix, prefix),
+		prefixExecPayloadCapella:   fmt.Sprintf("%s/%s:cache-execpayload-capella", redisPrefix, prefix),
+		prefixPayloadContentsDeneb: fmt.Sprintf("%s/%s:cache-payloadcontents-deneb", redisPrefix, prefix),
+		prefixInclusionProof:       fmt.Sprintf("%s/%s:cache-preconfirmations-proofs", redisPrefix, prefix),
+		prefixBidTrace:             fmt.Sprintf("%s/%s:cache-bid-trace", redisPrefix, prefix),
 
 		prefixBlockBuilderLatestBids:      fmt.Sprintf("%s/%s:block-builder-latest-bid", redisPrefix, prefix),       // hashmap for slot+parentHash+proposerPubkey with builderPubkey as field
 		prefixBlockBuilderLatestBidsValue: fmt.Sprintf("%s/%s:block-builder-latest-bid-value", redisPrefix, prefix), // hashmap for slot+parentHash+proposerPubkey with builderPubkey as field
@@ -137,8 +139,8 @@ func NewRedisCache(prefix, redisURI, readonlyURI string) (*RedisCache, error) {
 		prefixFloorBid:                    fmt.Sprintf("%s/%s:bid-floor", redisPrefix, prefix),                      // prefix:slot_parentHash_proposerPubkey
 		prefixFloorBidValue:               fmt.Sprintf("%s/%s:bid-floor-value", redisPrefix, prefix),                // prefix:slot_parentHash_proposerPubkey
 
-		keyValidatorRegistrationData: fmt.Sprintf("%s/%s:validator-registration-data", redisPrefix, prefix),
-		keyRelayConfig:               fmt.Sprintf("%s/%s:relay-config", redisPrefix, prefix),
+		keyValidatorRegistrationTimestamp: fmt.Sprintf("%s/%s:validator-registration-timestamp", redisPrefix, prefix),
+		keyRelayConfig:                    fmt.Sprintf("%s/%s:relay-config", redisPrefix, prefix),
 
 		keyStats:              fmt.Sprintf("%s/%s:stats", redisPrefix, prefix),
 		keyProposerDuties:     fmt.Sprintf("%s/%s:proposer-duties", redisPrefix, prefix),
@@ -160,8 +162,8 @@ func (r *RedisCache) keyPayloadContentsDeneb(slot uint64, proposerPubkey, blockH
 	return fmt.Sprintf("%s:%d_%s_%s", r.prefixPayloadContentsDeneb, slot, proposerPubkey, blockHash)
 }
 
-func (r *RedisCache) keyPayloadContentsElectra(slot uint64, proposerPubkey, blockHash string) string {
-	return fmt.Sprintf("%s:%d_%s_%s", r.prefixPayloadContentsElectra, slot, proposerPubkey, blockHash)
+func (r *RedisCache) keyInclusionProof(slot uint64, proposerPubkey string, blockHash string) string {
+	return fmt.Sprintf("%s:%d_%s_%s", r.prefixInclusionProof, slot, proposerPubkey, blockHash)
 }
 
 func (r *RedisCache) keyCacheBidTrace(slot uint64, proposerPubkey, blockHash string) string {
@@ -240,26 +242,27 @@ func (r *RedisCache) HSetObj(key, field string, value any, expiration time.Durat
 	return r.client.Expire(context.Background(), key, expiration).Err()
 }
 
-func (r *RedisCache) GetValidatorRegistrationData(proposerPubkey common.PubkeyHex) (*builderApiV1.ValidatorRegistration, error) {
-	data := new(builderApiV1.ValidatorRegistration)
-
-	// common.PubkeyHex is lowercase at the time of creation
-	dataRaw, err := r.client.HGet(context.Background(), r.keyValidatorRegistrationData, proposerPubkey.String()).Result()
+func (r *RedisCache) GetValidatorRegistrationTimestamp(proposerPubkey common.PubkeyHex) (uint64, error) {
+	timestamp, err := r.client.HGet(context.Background(), r.keyValidatorRegistrationTimestamp, strings.ToLower(proposerPubkey.String())).Uint64()
 	if errors.Is(err, redis.Nil) {
-		return nil, nil
+		return 0, nil
 	}
-	err = data.UnmarshalSSZ([]byte(dataRaw))
-	return data, err
+	return timestamp, err
 }
 
-func (r *RedisCache) SetValidatorRegistrationData(data *builderApiV1.ValidatorRegistration) error {
-	pk := strings.ToLower(data.Pubkey.String())
-
-	dataBytes, err := data.MarshalSSZ()
+func (r *RedisCache) SetValidatorRegistrationTimestampIfNewer(proposerPubkey common.PubkeyHex, timestamp uint64) error {
+	knownTimestamp, err := r.GetValidatorRegistrationTimestamp(proposerPubkey)
 	if err != nil {
 		return err
 	}
-	return r.client.HSet(context.Background(), r.keyValidatorRegistrationData, pk, dataBytes).Err()
+	if knownTimestamp >= timestamp {
+		return nil
+	}
+	return r.SetValidatorRegistrationTimestamp(proposerPubkey, timestamp)
+}
+
+func (r *RedisCache) SetValidatorRegistrationTimestamp(proposerPubkey common.PubkeyHex, timestamp uint64) error {
+	return r.client.HSet(context.Background(), r.keyValidatorRegistrationTimestamp, proposerPubkey.String(), timestamp).Err()
 }
 
 func (r *RedisCache) CheckAndSetLastSlotAndHashDelivered(slot uint64, hash string) (err error) {
@@ -360,8 +363,21 @@ func (r *RedisCache) GetRelayConfig(field string) (string, error) {
 
 func (r *RedisCache) GetBestBid(slot uint64, parentHash, proposerPubkey string) (*builderSpec.VersionedSignedBuilderBid, error) {
 	key := r.keyCacheGetHeaderResponse(slot, parentHash, proposerPubkey)
+	r.boltLog.Info("Getting best bid from Redis with key ", key)
 	resp := new(builderSpec.VersionedSignedBuilderBid)
 	err := r.GetObj(key, resp)
+	if errors.Is(err, redis.Nil) {
+		r.boltLog.WithError(err).Errorf("Failed to find bid with key %s in Redis", key)
+		return nil, nil
+	}
+	return resp, err
+}
+
+func (r *RedisCache) GetInclusionProof(slot uint64, proposerPubkey string, bidBlockHash string) (*common.InclusionProof, error) {
+	key := r.keyInclusionProof(slot, proposerPubkey, bidBlockHash)
+	r.boltLog.Infof("Getting preconfirmations proofs from Redis with key %s", key)
+	resp := new(common.InclusionProof)
+	err := r.GetObj(key, &resp)
 	if errors.Is(err, redis.Nil) {
 		return nil, nil
 	}
@@ -369,49 +385,20 @@ func (r *RedisCache) GetBestBid(slot uint64, parentHash, proposerPubkey string) 
 }
 
 func (r *RedisCache) GetPayloadContents(slot uint64, proposerPubkey, blockHash string) (*builderApi.VersionedSubmitBlindedBlockResponse, error) {
-	resp, err := r.GetPayloadContentsElectra(slot, proposerPubkey, blockHash)
+	resp, err := r.GetPayloadContentsDeneb(slot, proposerPubkey, blockHash)
 	if errors.Is(err, redis.Nil) {
-		resp, err = r.GetPayloadContentsDeneb(slot, proposerPubkey, blockHash)
-		if errors.Is(err, redis.Nil) {
-			return r.GetExecutionPayloadCapella(slot, proposerPubkey, blockHash)
-		}
+		// can't find deneb payload, try find capella payload
+		return r.GetExecutionPayloadCapella(slot, proposerPubkey, blockHash)
 	}
 	return resp, err
 }
 
-func (r *RedisCache) SavePayloadContentsElectra(ctx context.Context, tx redis.Pipeliner, slot uint64, proposerPubkey, blockHash string, execPayload *builderApiDeneb.ExecutionPayloadAndBlobsBundle) (err error) {
-	key := r.keyPayloadContentsElectra(slot, proposerPubkey, blockHash)
-	b, err := execPayload.MarshalSSZ()
-	if err != nil {
-		return err
-	}
-	return tx.Set(ctx, key, b, expiryBidCache).Err()
-}
-
-func (r *RedisCache) GetPayloadContentsElectra(slot uint64, proposerPubkey, blockHash string) (*builderApi.VersionedSubmitBlindedBlockResponse, error) {
-	electraPayloadContents := new(builderApiDeneb.ExecutionPayloadAndBlobsBundle)
-
-	key := r.keyPayloadContentsElectra(slot, proposerPubkey, blockHash)
-	val, err := r.client.Get(context.Background(), key).Result()
-	if err != nil {
-		return nil, err
-	}
-
-	err = electraPayloadContents.UnmarshalSSZ([]byte(val))
-	if err != nil {
-		return nil, err
-	}
-
-	return &builderApi.VersionedSubmitBlindedBlockResponse{
-		Version: spec.DataVersionElectra,
-		Electra: electraPayloadContents,
-	}, nil
-}
-
 func (r *RedisCache) SavePayloadContentsDeneb(ctx context.Context, tx redis.Pipeliner, slot uint64, proposerPubkey, blockHash string, execPayload *builderApiDeneb.ExecutionPayloadAndBlobsBundle) (err error) {
 	key := r.keyPayloadContentsDeneb(slot, proposerPubkey, blockHash)
+	r.boltLog.Infof("Saving execution payload deneb with key %s", key)
 	b, err := execPayload.MarshalSSZ()
 	if err != nil {
+		r.boltLog.WithError(err).Errorf("Error while saving executing payload deneb with key %s", key)
 		return err
 	}
 	return tx.Set(ctx, key, b, expiryBidCache).Err()
@@ -439,8 +426,25 @@ func (r *RedisCache) GetPayloadContentsDeneb(slot uint64, proposerPubkey, blockH
 
 func (r *RedisCache) SaveExecutionPayloadCapella(ctx context.Context, pipeliner redis.Pipeliner, slot uint64, proposerPubkey, blockHash string, execPayload *capella.ExecutionPayload) (err error) {
 	key := r.keyExecPayloadCapella(slot, proposerPubkey, blockHash)
+	r.boltLog.Infof("Saving execution payload capella with key %s", key)
 	b, err := execPayload.MarshalSSZ()
 	if err != nil {
+		r.boltLog.WithError(err).Errorf("Error while saving executing payload with key %s", key)
+		return err
+	}
+	return pipeliner.Set(ctx, key, b, expiryBidCache).Err()
+}
+
+// SavePreconfirmationsProofs saves the preconfirmation proofs in the Redis cache with JSON encoding
+// TODO: maybe ssz encoding?
+func (r *RedisCache) SaveInclusionProof(ctx context.Context, pipeliner redis.Pipeliner,
+	slot uint64, proposerPubkey string, bidBlockHash string, proof *common.InclusionProof,
+) (err error) {
+	key := r.keyInclusionProof(slot, proposerPubkey, bidBlockHash)
+	r.boltLog.Infof("Saving %d inclusion proofs with key %s", len(proof.TransactionHashes), key)
+	b, err := json.Marshal(proof)
+	if err != nil {
+		r.boltLog.WithError(err).Errorf("Failed to marshal preconfirmations proofs for slot %d", slot)
 		return err
 	}
 	return pipeliner.Set(ctx, key, b, expiryBidCache).Err()
@@ -495,6 +499,7 @@ func (r *RedisCache) GetBuilderLatestPayloadReceivedAt(ctx context.Context, pipe
 func (r *RedisCache) SaveBuilderBid(ctx context.Context, pipeliner redis.Pipeliner, slot uint64, parentHash, proposerPubkey, builderPubkey string, receivedAt time.Time, headerResp *builderSpec.VersionedSignedBuilderBid) (err error) {
 	// save the actual bid
 	keyLatestBid := r.keyLatestBidByBuilder(slot, parentHash, proposerPubkey, builderPubkey)
+	r.boltLog.Infof("Saving latest builder bid with key %s", keyLatestBid)
 	err = r.SetObjPipelined(ctx, pipeliner, keyLatestBid, headerResp, expiryBidCache)
 	if err != nil {
 		return err
@@ -513,6 +518,7 @@ func (r *RedisCache) SaveBuilderBid(ctx context.Context, pipeliner redis.Pipelin
 
 	// set the value last, because that's iterated over when updating the best bid, and the payload has to be available
 	keyLatestBidsValue := r.keyBlockBuilderLatestBidsValue(slot, parentHash, proposerPubkey)
+	r.boltLog.Infof("Saving latest builder bid with value and with key %s", keyLatestBidsValue)
 	value, err := headerResp.Value()
 	if err != nil {
 		return err
@@ -540,7 +546,18 @@ type SaveBidAndUpdateTopBidResponse struct {
 	TimeUpdateFloor  time.Duration
 }
 
-func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis.Pipeliner, trace *common.BidTraceV2WithBlobFields, payload *common.VersionedSubmitBlockRequest, getPayloadResponse *builderApi.VersionedSubmitBlindedBlockResponse, getHeaderResponse *builderSpec.VersionedSignedBuilderBid, reqReceivedAt time.Time, isCancellationEnabled bool, floorValue *big.Int) (state SaveBidAndUpdateTopBidResponse, err error) {
+func (r *RedisCache) SaveBidAndUpdateTopBid(
+	ctx context.Context,
+	pipeliner redis.Pipeliner,
+	trace *common.BidTraceV2WithBlobFields,
+	payload *common.VersionedSubmitBlockRequest,
+	getPayloadResponse *builderApi.VersionedSubmitBlindedBlockResponse,
+	getHeaderResponse *builderSpec.VersionedSignedBuilderBid,
+	reqReceivedAt time.Time,
+	isCancellationEnabled bool,
+	floorValue *big.Int,
+	proof *common.InclusionProof,
+) (state SaveBidAndUpdateTopBidResponse, err error) {
 	var prevTime, nextTime time.Time
 	prevTime = time.Now()
 
@@ -596,13 +613,17 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 		if err != nil {
 			return state, err
 		}
-	case spec.DataVersionElectra:
-		err = r.SavePayloadContentsElectra(ctx, pipeliner, submission.BidTrace.Slot, submission.BidTrace.ProposerPubkey.String(), submission.BidTrace.BlockHash.String(), getPayloadResponse.Electra)
-		if err != nil {
-			return state, err
-		}
 	case spec.DataVersionUnknown, spec.DataVersionPhase0, spec.DataVersionAltair, spec.DataVersionBellatrix:
 		return state, fmt.Errorf("unsupported payload version: %s", payload.Version) //nolint:goerr113
+	}
+
+	// BOLT: If preconfirmations proofs are available, save them
+	if proof != nil {
+		err = r.SaveInclusionProof(ctx, pipeliner, submission.BidTrace.Slot, submission.BidTrace.ProposerPubkey.String(), submission.BidTrace.BlockHash.String(), proof)
+		if err != nil {
+			r.boltLog.WithError(err).Errorf("Failed to save preconfirmations proofs to redis for slot %d", submission.BidTrace.Slot)
+			return state, err
+		}
 	}
 
 	// Record time needed to save payload
@@ -613,6 +634,7 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 	// 2. Save latest bid for this builder
 	err = r.SaveBuilderBid(ctx, pipeliner, submission.BidTrace.Slot, submission.BidTrace.ParentHash.String(), submission.BidTrace.ProposerPubkey.String(), submission.BidTrace.BuilderPubkey.String(), reqReceivedAt, getHeaderResponse)
 	if err != nil {
+		r.boltLog.WithError(err).Errorf("Failed to save latest bid for builder %s to redis for slot %d", submission.BidTrace.BuilderPubkey.String(), submission.BidTrace.Slot)
 		return state, err
 	}
 	builderBids.bidValues[submission.BidTrace.BuilderPubkey.String()] = submission.BidTrace.Value.ToBig()
@@ -633,7 +655,7 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 	state.TimeSaveTrace = nextTime.Sub(prevTime)
 	prevTime = nextTime
 
-	// If top bid value hasn't changed, abort now
+	// If top bid value hasn't change, abort now
 	_, state.TopBidValue = builderBids.getTopBid()
 	if state.TopBidValue.Cmp(state.PrevTopBidValue) == 0 {
 		return state, nil
@@ -692,7 +714,19 @@ func (r *RedisCache) SaveBidAndUpdateTopBid(ctx context.Context, pipeliner redis
 	return state, err
 }
 
-func (r *RedisCache) _updateTopBid(ctx context.Context, pipeliner redis.Pipeliner, state SaveBidAndUpdateTopBidResponse, builderBids *BuilderBids, slot uint64, parentHash, proposerPubkey string, floorValue *big.Int) (resp SaveBidAndUpdateTopBidResponse, err error) {
+func (r *RedisCache) _updateTopBid(
+	ctx context.Context,
+	pipeliner redis.Pipeliner,
+	state SaveBidAndUpdateTopBidResponse,
+	builderBids *BuilderBids,
+	slot uint64,
+	parentHash,
+	proposerPubkey string,
+	floorValue *big.Int) (
+	resp SaveBidAndUpdateTopBidResponse, err error,
+) {
+	r.boltLog.Info("Updating top bid")
+
 	if builderBids == nil {
 		builderBids, err = NewBuilderBidsFromRedis(ctx, r, pipeliner, slot, parentHash, proposerPubkey)
 		if err != nil {
@@ -724,6 +758,7 @@ func (r *RedisCache) _updateTopBid(ctx context.Context, pipeliner redis.Pipeline
 
 	// Copy winning bid to top bid cache
 	keyTopBid := r.keyCacheGetHeaderResponse(slot, parentHash, proposerPubkey)
+	r.boltLog.Infof("Copying winning bid from %s to %s", keyBidSource, keyTopBid)
 	c := pipeliner.Copy(context.Background(), keyBidSource, keyTopBid, 0, true)
 	_, err = pipeliner.Exec(ctx)
 	if err != nil {
@@ -744,6 +779,7 @@ func (r *RedisCache) _updateTopBid(ctx context.Context, pipeliner redis.Pipeline
 
 	// 6. Finally, update the global top bid value
 	keyTopBidValue := r.keyTopBidValue(slot, parentHash, proposerPubkey)
+	r.boltLog.Info("Updating global top bid value with key", keyTopBid)
 	err = pipeliner.Set(context.Background(), keyTopBidValue, state.TopBidValue.String(), expiryBidCache).Err()
 	if err != nil {
 		return state, err
@@ -847,6 +883,6 @@ func (r *RedisCache) NewPipeline() redis.Pipeliner { //nolint:ireturn,nolintlint
 	return r.client.Pipeline()
 }
 
-func (r *RedisCache) NewTxPipeline() redis.Pipeliner { //nolint:ireturn,nolintlint
+func (r *RedisCache) NewTxPipeline() redis.Pipeliner { //nolint:ireturn
 	return r.client.TxPipeline()
 }

@@ -168,10 +168,6 @@ func (hk *Housekeeper) updateProposerDuties(headSlot uint64) {
 		return
 	}
 
-	hk.UpdateProposerDutiesWithoutChecks(headSlot)
-}
-
-func (hk *Housekeeper) UpdateProposerDutiesWithoutChecks(headSlot uint64) {
 	epoch := headSlot / common.SlotsPerEpoch
 
 	log := hk.log.WithFields(logrus.Fields{
@@ -250,38 +246,21 @@ func (hk *Housekeeper) UpdateProposerDutiesWithoutChecks(headSlot uint64) {
 
 // updateValidatorRegistrationsInRedis saves all latest validator registrations from the database to Redis
 func (hk *Housekeeper) updateValidatorRegistrationsInRedis() {
-	log := hk.log
-	log.Infof("updateValidatorRegistrationsInRedis: getting registrations from DB...")
-
-	timeStarted := time.Now()
-	regs, err := hk.db.GetLatestValidatorRegistrations(false)
+	regs, err := hk.db.GetLatestValidatorRegistrations(true)
 	if err != nil {
-		log.WithError(err).Error("failed to get latest validator registrations")
+		hk.log.WithError(err).Error("failed to get latest validator registrations")
 		return
 	}
 
-	log = log.WithFields(logrus.Fields{
-		"numRegistrations": len(regs),
-		"timeNeededDBSec":  time.Since(timeStarted).Seconds(),
-	})
-	log.Info("updateValidatorRegistrationsInRedis: got registrations from DB, updating Redis (this may take a while)...")
+	hk.log.Infof("updating %d validator registrations in Redis...", len(regs))
+	timeStarted := time.Now()
 
-	timeStarted = time.Now()
 	for _, reg := range regs {
-		// convert DB data to original struct
-		data, err := reg.ToSignedValidatorRegistration()
+		err = hk.redis.SetValidatorRegistrationTimestampIfNewer(common.NewPubkeyHex(reg.Pubkey), reg.Timestamp)
 		if err != nil {
-			log.WithError(err).Error("failed to convert validator registration entry to signed validator registration")
-			continue
-		}
-
-		// save to Redis
-		err = hk.redis.SetValidatorRegistrationData(data.Message)
-		if err != nil {
-			log.WithError(err).Error("failed to set validator registration")
+			hk.log.WithError(err).Error("failed to set validator registration")
 			continue
 		}
 	}
-
-	log.WithField("timeNeededRedisSec", time.Since(timeStarted).Seconds()).Info("updateValidatorRegistrationsInRedis: updating Redis done")
+	hk.log.Infof("updating %d validator registrations in Redis done - %f sec", len(regs), time.Since(timeStarted).Seconds())
 }

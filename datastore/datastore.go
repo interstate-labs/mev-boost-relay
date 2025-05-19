@@ -14,8 +14,8 @@ import (
 	"github.com/flashbots/mev-boost-relay/beaconclient"
 	"github.com/flashbots/mev-boost-relay/common"
 	"github.com/flashbots/mev-boost-relay/database"
+	"github.com/go-redis/redis/v9"
 	"github.com/pkg/errors"
-	"github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
 	uberatomic "go.uber.org/atomic"
 )
@@ -46,9 +46,6 @@ type Datastore struct {
 	knownValidatorsIsUpdating uberatomic.Bool
 	knownValidatorsLastSlot   uberatomic.Uint64
 
-	validatorRegistrations    map[common.PubkeyHex]builderApiV1.ValidatorRegistration
-	validatorRegistrationLock sync.RWMutex
-
 	// Used for proposer-API readiness check
 	KnownValidatorsWasUpdated uberatomic.Bool
 }
@@ -58,7 +55,6 @@ func NewDatastore(redisCache *RedisCache, memcached *Memcached, db database.IDat
 		db:                      db,
 		memcached:               memcached,
 		redis:                   redisCache,
-		validatorRegistrations:  make(map[common.PubkeyHex]builderApiV1.ValidatorRegistration),
 		knownValidatorsByPubkey: make(map[common.PubkeyHex]uint64),
 		knownValidatorsByIndex:  make(map[uint64]common.PubkeyHex),
 	}
@@ -111,10 +107,6 @@ func (ds *Datastore) RefreshKnownValidators(log *logrus.Entry, beaconClient beac
 		time.Sleep(6 * time.Second)
 	}
 
-	ds.RefreshKnownValidatorsWithoutChecks(log, beaconClient, slot)
-}
-
-func (ds *Datastore) RefreshKnownValidatorsWithoutChecks(log *logrus.Entry, beaconClient beaconclient.IMultiBeaconClient, slot uint64) {
 	log.Info("Querying validators from beacon node... (this may take a while)")
 	timeStartFetching := time.Now()
 	validators, err := beaconClient.GetStateValidators(beaconclient.StateIDHead) // head is fastest
@@ -180,56 +172,17 @@ func (ds *Datastore) NumRegisteredValidators() (uint64, error) {
 	return ds.db.NumRegisteredValidators()
 }
 
-func (ds *Datastore) SetKnownValidator(pubkeyHex common.PubkeyHex, index uint64) {
-	ds.knownValidatorsLock.Lock()
-	defer ds.knownValidatorsLock.Unlock()
-
-	ds.knownValidatorsByPubkey[pubkeyHex] = index
-	ds.knownValidatorsByIndex[index] = pubkeyHex
-}
-
-// GetCachedValidatorRegistration returns a validator registration from local cache or Redis
-// If not found, it returns (nil, nil)
-func (ds *Datastore) GetCachedValidatorRegistration(proposerPubkey common.PubkeyHex) (*builderApiV1.ValidatorRegistration, error) {
-	var err error
-
-	// acquire read lock and read
-	ds.validatorRegistrationLock.RLock()
-	cachedRegistration, foundInLocalCache := ds.validatorRegistrations[proposerPubkey]
-	ds.validatorRegistrationLock.RUnlock()
-	if foundInLocalCache {
-		return &cachedRegistration, nil
-	}
-
-	// if not, try to get it from Redis
-	cachedRegistrationData, err := ds.redis.GetValidatorRegistrationData(proposerPubkey)
-	if err == nil && cachedRegistrationData != nil {
-		// save in local cache
-		ds.saveValidatorRegistrationInLocalCache(*cachedRegistrationData)
-	}
-	return cachedRegistrationData, err
-}
-
-func (ds *Datastore) saveValidatorRegistrationInLocalCache(entry builderApiV1.ValidatorRegistration) {
-	ds.validatorRegistrationLock.Lock()
-	ds.validatorRegistrations[common.NewPubkeyHex(entry.Pubkey.String())] = entry
-	ds.validatorRegistrationLock.Unlock()
-}
-
-// SaveValidatorRegistration saves a validator registration into local cache, Redis and the database
-// Note that this function is called synchronously, so no need to lock the cache
+// SaveValidatorRegistration saves a validator registration into both Redis and the database
 func (ds *Datastore) SaveValidatorRegistration(entry builderApiV1.SignedValidatorRegistration) error {
-	// Save in local cache
-	ds.saveValidatorRegistrationInLocalCache(*entry.Message)
-
-	// Save in the database
+	// First save in the database
 	err := ds.db.SaveValidatorRegistration(database.SignedValidatorRegistrationToEntry(entry))
 	if err != nil {
 		return errors.Wrap(err, "failed saving validator registration to database")
 	}
 
-	// Save in Redis
-	err = ds.redis.SetValidatorRegistrationData(entry.Message)
+	// then save in redis
+	pk := common.NewPubkeyHex(entry.Message.Pubkey.String())
+	err = ds.redis.SetValidatorRegistrationTimestampIfNewer(pk, uint64(entry.Message.Timestamp.Unix()))
 	if err != nil {
 		return errors.Wrap(err, "failed saving validator registration to redis")
 	}

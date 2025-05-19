@@ -24,7 +24,7 @@ var (
 	apiDefaultSecretKey  = common.GetEnv("SECRET_KEY", "")
 	apiDefaultLogTag     = os.Getenv("LOG_TAG")
 
-	apiDefaultPprofListenAddr    = os.Getenv("PPROF_ADDR")
+	apiDefaultPprofEnabled       = os.Getenv("PPROF") == "1"
 	apiDefaultInternalAPIEnabled = os.Getenv("ENABLE_INTERNAL_API") == "1"
 
 	// Default Builder, Data, and Proposer API as true.
@@ -32,16 +32,16 @@ var (
 	apiDefaultDataAPIEnabled     = os.Getenv("DISABLE_DATA_API") != "1"
 	apiDefaultProposerAPIEnabled = os.Getenv("DISABLE_PROPOSER_API") != "1"
 
-	apiListenAddr      string
-	apiPprofListenAddr string
-	apiSecretKey       string
-	apiBlockSimURL     string
-	apiDebug           bool
-	apiBuilderAPI      bool
-	apiDataAPI         bool
-	apiInternalAPI     bool
-	apiProposerAPI     bool
-	apiLogTag          string
+	apiListenAddr   string
+	apiPprofEnabled bool
+	apiSecretKey    string
+	apiBlockSimURL  string
+	apiDebug        bool
+	apiBuilderAPI   bool
+	apiDataAPI      bool
+	apiInternalAPI  bool
+	apiProposerAPI  bool
+	apiLogTag       string
 )
 
 func init() {
@@ -53,7 +53,6 @@ func init() {
 
 	apiCmd.Flags().StringVar(&apiListenAddr, "listen-addr", apiDefaultListenAddr, "listen address for webserver")
 	apiCmd.Flags().StringSliceVar(&beaconNodeURIs, "beacon-uris", defaultBeaconURIs, "beacon endpoints")
-	apiCmd.Flags().StringSliceVar(&beaconNodePublishURIs, "beacon-publish-uris", defaultBeaconPublishURIs, "beacon publish endpoints")
 	apiCmd.Flags().StringVar(&redisURI, "redis-uri", defaultRedisURI, "redis uri")
 	apiCmd.Flags().StringVar(&redisReadonlyURI, "redis-readonly-uri", defaultRedisReadonlyURI, "redis readonly uri")
 	apiCmd.Flags().StringVar(&postgresDSN, "db", defaultPostgresDSN, "PostgreSQL DSN")
@@ -63,8 +62,7 @@ func init() {
 	apiCmd.Flags().StringVar(&apiBlockSimURL, "blocksim", apiDefaultBlockSim, "URL for block simulator")
 	apiCmd.Flags().StringVar(&network, "network", defaultNetwork, "Which network to use")
 
-	apiCmd.Flags().StringVar(&apiPprofListenAddr, "pprof-listen-addr", apiDefaultPprofListenAddr, "listen address for pprof, empty to disable")
-
+	apiCmd.Flags().BoolVar(&apiPprofEnabled, "pprof", apiDefaultPprofEnabled, "enable pprof API")
 	apiCmd.Flags().BoolVar(&apiBuilderAPI, "builder-api", apiDefaultBuilderAPIEnabled, "enable builder API (/builder/...)")
 	apiCmd.Flags().BoolVar(&apiDataAPI, "data-api", apiDefaultDataAPIEnabled, "enable data API (/data/...)")
 	apiCmd.Flags().BoolVar(&apiInternalAPI, "internal-api", apiDefaultInternalAPIEnabled, "enable internal API (/internal/...)")
@@ -102,18 +100,9 @@ var apiCmd = &cobra.Command{
 			log.Fatalf("no beacon endpoints specified")
 		}
 		log.Infof("Using beacon endpoints: %s", strings.Join(beaconNodeURIs, ", "))
-		if len(beaconNodePublishURIs) == 0 {
-			// default to same endpoint as the beacon endpoints
-			beaconNodePublishURIs = beaconNodeURIs
-		} else if len(beaconNodePublishURIs) != len(beaconNodeURIs) {
-			log.Fatalf("beacon publish endpoints do not match the number of beacon endpoints")
-		} else {
-			log.Infof("Using beacon publish endpoints: %s", strings.Join(beaconNodePublishURIs, ", "))
-		}
-
 		var beaconInstances []beaconclient.IBeaconInstance
-		for i, uri := range beaconNodeURIs {
-			beaconInstances = append(beaconInstances, beaconclient.NewProdBeaconInstance(log, uri, beaconNodePublishURIs[i]))
+		for _, uri := range beaconNodeURIs {
+			beaconInstances = append(beaconInstances, beaconclient.NewProdBeaconInstance(log, uri))
 		}
 		beaconClient := beaconclient.NewMultiBeaconClient(log, beaconInstances)
 
@@ -166,12 +155,11 @@ var apiCmd = &cobra.Command{
 			EthNetDetails: *networkInfo,
 			BlockSimURL:   apiBlockSimURL,
 
-			PprofListenAddr: apiPprofListenAddr,
-
 			BlockBuilderAPI: apiBuilderAPI,
 			DataAPI:         apiDataAPI,
 			InternalAPI:     apiInternalAPI,
 			ProposerAPI:     apiProposerAPI,
+			PprofAPI:        apiPprofEnabled,
 		}
 
 		// Decode the private key

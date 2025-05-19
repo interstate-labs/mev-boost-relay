@@ -9,7 +9,6 @@ import (
 
 	"github.com/flashbots/mev-boost-relay/common"
 	"github.com/gorilla/mux"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -34,7 +33,7 @@ type testBackend struct {
 func newTestBackend(t require.TestingT, numBeaconNodes int) *testBackend {
 	mockBeaconInstances := make([]*MockBeaconInstance, numBeaconNodes)
 	beaconInstancesInterface := make([]IBeaconInstance, numBeaconNodes)
-	for i := range numBeaconNodes {
+	for i := 0; i < numBeaconNodes; i++ {
 		mockBeaconInstances[i] = NewMockBeaconInstance()
 		beaconInstancesInterface[i] = mockBeaconInstances[i]
 	}
@@ -49,7 +48,7 @@ func newTestBackend(t require.TestingT, numBeaconNodes int) *testBackend {
 func TestBeaconInstance(t *testing.T) {
 	r := mux.NewRouter()
 	srv := httptest.NewServer(r)
-	bc := NewProdBeaconInstance(common.TestLog, srv.URL, srv.URL)
+	bc := NewProdBeaconInstance(common.TestLog, srv.URL)
 
 	r.HandleFunc("/eth/v1/beacon/states/1/validators", func(w http.ResponseWriter, _ *http.Request) {
 		resp := []byte(`{
@@ -73,7 +72,7 @@ func TestBeaconInstance(t *testing.T) {
   ]
 }`)
 		_, err := w.Write(resp)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 	})
 
 	vals, err := bc.GetStateValidators("1")
@@ -100,7 +99,7 @@ func TestGetSyncStatus(t *testing.T) {
 		}
 
 		backend := newTestBackend(t, 3)
-		for i := range backend.beaconInstances {
+		for i := 0; i < len(backend.beaconInstances); i++ {
 			backend.beaconInstances[i].MockSyncStatus = syncStatuses[i]
 			backend.beaconInstances[i].ResponseDelay = 10 * time.Millisecond * time.Duration(i)
 		}
@@ -177,7 +176,9 @@ func TestFetchValidators(t *testing.T) {
 			Validator: ValidatorResponseValidatorData{
 				Pubkey: testPubKey,
 			},
-			Index: 0,
+			Index:   0,
+			Balance: "0",
+			Status:  "",
 		}
 
 		backend := newTestBackend(t, 3)
@@ -205,7 +206,7 @@ func TestFetchValidators(t *testing.T) {
 func TestGetForkSchedule(t *testing.T) {
 	r := mux.NewRouter()
 	srv := httptest.NewServer(r)
-	bc := NewProdBeaconInstance(common.TestLog, srv.URL, srv.URL)
+	bc := NewProdBeaconInstance(common.TestLog, srv.URL)
 
 	r.HandleFunc("/eth/v1/config/fork_schedule", func(w http.ResponseWriter, _ *http.Request) {
 		resp := []byte(`{
@@ -233,7 +234,7 @@ func TestGetForkSchedule(t *testing.T) {
 			]
 		  }`)
 		_, err := w.Write(resp)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 	})
 
 	forkSchedule, err := bc.GetForkSchedule()

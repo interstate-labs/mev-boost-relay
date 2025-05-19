@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,10 +13,9 @@ import (
 	"time"
 
 	"github.com/attestantio/go-eth2-client/spec"
-	"github.com/flashbots/go-utils/cli"
-	"github.com/flashbots/go-utils/jsonrpc"
+	"github.com/thedevbirb/flashbots-go-utils/cli"
+	"github.com/thedevbirb/flashbots-go-utils/jsonrpc"
 	"github.com/flashbots/mev-boost-relay/common"
-	"github.com/goccy/go-json"
 )
 
 var (
@@ -24,14 +24,13 @@ var (
 	ErrJSONDecodeFailed = errors.New("json error")
 	ErrNoCapellaPayload = errors.New("capella payload is nil")
 	ErrNoDenebPayload   = errors.New("deneb payload is nil")
-	ErrNoElectraPayload = errors.New("electra payload is nil")
 
 	maxConcurrentBlocks = int64(cli.GetEnvInt("BLOCKSIM_MAX_CONCURRENT", 4)) // 0 for no maximum
 	simRequestTimeout   = time.Duration(cli.GetEnvInt("BLOCKSIM_TIMEOUT_MS", 10000)) * time.Millisecond
 )
 
 type IBlockSimRateLimiter interface {
-	Send(context context.Context, payload *common.BuilderBlockValidationRequest, isHighPrio, fastTrack bool) (*common.BuilderBlockValidationResponse, error, error)
+	Send(context context.Context, payload *common.BuilderBlockValidationRequest, isHighPrio, fastTrack bool) (error, error)
 	CurrentCounter() int64
 }
 
@@ -59,12 +58,7 @@ func NewBlockSimulationRateLimiter(blockSimURL string) *BlockSimulationRateLimit
 	}
 }
 
-func (b *BlockSimulationRateLimiter) Send(
-	context context.Context,
-	payload *common.BuilderBlockValidationRequest,
-	isHighPrio,
-	fastTrack bool,
-) (response *common.BuilderBlockValidationResponse, requestErr, validationErr error) {
+func (b *BlockSimulationRateLimiter) Send(context context.Context, payload *common.BuilderBlockValidationRequest, isHighPrio, fastTrack bool) (requestErr, validationErr error) {
 	b.cv.L.Lock()
 	cnt := atomic.AddInt64(&b.counter, 1)
 	if maxConcurrentBlocks > 0 && cnt > maxConcurrentBlocks {
@@ -80,25 +74,21 @@ func (b *BlockSimulationRateLimiter) Send(
 	}()
 
 	if err := context.Err(); err != nil {
-		return nil, fmt.Errorf("%w, %w", ErrRequestClosed, err), nil
+		return fmt.Errorf("%w, %w", ErrRequestClosed, err), nil
 	}
 
 	var simReq *jsonrpc.JSONRPCRequest
 	if payload.Version == spec.DataVersionCapella && payload.Capella == nil {
-		return nil, ErrNoCapellaPayload, nil
+		return ErrNoCapellaPayload, nil
 	}
 
 	if payload.Version == spec.DataVersionDeneb && payload.Deneb == nil {
-		return nil, ErrNoDenebPayload, nil
-	}
-
-	if payload.Version == spec.DataVersionElectra && payload.Electra == nil {
-		return nil, ErrNoElectraPayload, nil
+		return ErrNoDenebPayload, nil
 	}
 
 	submission, err := common.GetBlockSubmissionInfo(payload.VersionedSubmitBlockRequest)
 	if err != nil {
-		return nil, err, nil
+		return err, nil
 	}
 
 	// Prepare headers
@@ -112,21 +102,13 @@ func (b *BlockSimulationRateLimiter) Send(
 	}
 
 	// Create and fire off JSON-RPC request
-	if payload.Version == spec.DataVersionElectra {
-		simReq = jsonrpc.NewJSONRPCRequest("1", "flashbots_validateBuilderSubmissionV4", payload)
-	} else if payload.Version == spec.DataVersionDeneb {
+	if payload.Version == spec.DataVersionDeneb {
 		simReq = jsonrpc.NewJSONRPCRequest("1", "flashbots_validateBuilderSubmissionV3", payload)
 	} else {
 		simReq = jsonrpc.NewJSONRPCRequest("1", "flashbots_validateBuilderSubmissionV2", payload)
 	}
-	res, requestErr, validationErr := SendJSONRPCRequest(&b.client, *simReq, b.blockSimURL, headers)
-	response = new(common.BuilderBlockValidationResponse)
-	if res != nil {
-		if err := json.Unmarshal(res.Result, response); err != nil {
-			return nil, fmt.Errorf("unable to unmarshal response: %w", err), validationErr
-		}
-	}
-	return response, requestErr, validationErr
+	_, requestErr, validationErr = SendJSONRPCRequest(&b.client, *simReq, b.blockSimURL, headers)
+	return requestErr, validationErr
 }
 
 // CurrentCounter returns the number of waiting and active requests
@@ -172,9 +154,6 @@ func SendJSONRPCRequest(client *http.Client, req jsonrpc.JSONRPCRequest, url str
 	}
 
 	if res.Error != nil {
-		if res.Error.Data != nil {
-			return res, nil, fmt.Errorf("%w: %s (%v)", ErrSimulationFailed, res.Error.Message, res.Error.Data)
-		}
 		return res, nil, fmt.Errorf("%w: %s", ErrSimulationFailed, res.Error.Message)
 	}
 	return res, nil, nil

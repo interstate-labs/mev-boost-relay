@@ -1,6 +1,7 @@
 package database
 
 import (
+	"encoding/json"
 	"errors"
 
 	builderApi "github.com/attestantio/go-builder-client/api"
@@ -8,7 +9,6 @@ import (
 	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/capella"
 	"github.com/flashbots/mev-boost-relay/common"
-	"github.com/goccy/go-json"
 )
 
 var ErrUnsupportedExecutionPayload = errors.New("unsupported execution payload version")
@@ -34,15 +34,6 @@ func PayloadToExecPayloadEntry(payload *common.VersionedSubmitBlockRequest) (*Ex
 			return nil, err
 		}
 		version = common.ForkVersionStringDeneb
-	case spec.DataVersionElectra:
-		_payload, err = json.Marshal(builderApiDeneb.ExecutionPayloadAndBlobsBundle{
-			ExecutionPayload: payload.Electra.ExecutionPayload,
-			BlobsBundle:      payload.Electra.BlobsBundle,
-		})
-		if err != nil {
-			return nil, err
-		}
-		version = common.ForkVersionStringElectra
 	case spec.DataVersionUnknown, spec.DataVersionPhase0, spec.DataVersionAltair, spec.DataVersionBellatrix:
 		return nil, ErrUnsupportedExecutionPayload
 	}
@@ -106,17 +97,7 @@ func BuilderSubmissionEntryToBidTraceV2WithTimestampJSON(payload *BuilderBlockSu
 
 func ExecutionPayloadEntryToExecutionPayload(executionPayloadEntry *ExecutionPayloadEntry) (payload *builderApi.VersionedSubmitBlindedBlockResponse, err error) {
 	payloadVersion := executionPayloadEntry.Version
-	if payloadVersion == common.ForkVersionStringElectra {
-		executionPayload := new(builderApiDeneb.ExecutionPayloadAndBlobsBundle)
-		err = json.Unmarshal([]byte(executionPayloadEntry.Payload), executionPayload)
-		if err != nil {
-			return nil, err
-		}
-		return &builderApi.VersionedSubmitBlindedBlockResponse{
-			Version: spec.DataVersionElectra,
-			Electra: executionPayload,
-		}, nil
-	} else if payloadVersion == common.ForkVersionStringDeneb {
+	if payloadVersion == common.ForkVersionStringDeneb {
 		executionPayload := new(builderApiDeneb.ExecutionPayloadAndBlobsBundle)
 		err = json.Unmarshal([]byte(executionPayloadEntry.Payload), executionPayload)
 		if err != nil {

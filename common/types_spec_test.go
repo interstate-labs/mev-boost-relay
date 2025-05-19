@@ -2,10 +2,10 @@ package common
 
 import (
 	"bytes"
+	"encoding/json"
 	"testing"
 
 	"github.com/attestantio/go-eth2-client/spec"
-	"github.com/goccy/go-json"
 	"github.com/stretchr/testify/require"
 )
 
@@ -23,7 +23,7 @@ func TestSubmitBuilderBlockJSON(t *testing.T) {
 	require.NoError(t, err)
 	expectedJSONBytes := buffer.Bytes()
 
-	require.JSONEq(t, string(expectedJSONBytes), string(marshalledJSONBytes))
+	require.Equal(t, expectedJSONBytes, marshalledJSONBytes)
 }
 
 func TestSignedBeaconBlockJSON(t *testing.T) {
@@ -56,7 +56,7 @@ func TestSignedBeaconBlockJSON(t *testing.T) {
 			marshalledJSONBytes, err := json.Marshal(blockRequest)
 			require.NoError(t, err)
 
-			require.JSONEq(t, string(expectedJSONBytes), string(marshalledJSONBytes))
+			require.Equal(t, expectedJSONBytes, marshalledJSONBytes)
 		})
 	}
 }
@@ -91,7 +91,7 @@ func TestSignedBlindedBlockJSON(t *testing.T) {
 			marshalledJSONBytes, err := json.Marshal(blockRequest)
 			require.NoError(t, err)
 
-			require.JSONEq(t, string(expectedJSONBytes), string(marshalledJSONBytes))
+			require.Equal(t, expectedJSONBytes, marshalledJSONBytes)
 		})
 	}
 }
