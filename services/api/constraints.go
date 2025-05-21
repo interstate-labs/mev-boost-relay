@@ -18,6 +18,7 @@ const (
 	// Specs: https://github.com/ethereum/consensus-specs/blob/9515f3e7e1ce893f97ac638d0280ea9026518bad/specs/bellatrix/beacon-chain.md#execution
 	MAX_CONSTRAINTS_PER_SLOT  = 1048576    // 2**20
 	MAX_BYTES_PER_TRANSACTION = 1073741824 // 2**30
+	MAX_RECEIVERS             = 1024
 )
 
 type SignedConstraints struct {
@@ -28,14 +29,16 @@ type SignedConstraints struct {
 }
 
 type ConstraintsMessage struct {
-	ValidatorIndex uint64        `json:"validator_index"`
+	Proposer    phase0.BLSPubkey      `ssz-size:"48" json:"proposer"`  // 48-byte BLS pubkey
+	Delegate    phase0.BLSPubkey      `ssz-size:"48" json:"delegate"`
 	Slot           uint64        `json:"slot"`
 	Constraints    []*Constraint `ssz-max:"1048576" json:"constraints"`
+	Receivers   []phase0.BLSPubkey    `ssz-max:"1024" json:"receivers"`
 }
 
 type Constraint struct {
-	Tx    Transaction `ssz-max:"1073741824" json:"tx"`
-	Index *Index      `json:"index"`
+	ConstraintType uint64 `json:"constraintType"`
+	Payload        []byte `ssz-max:"1073741824" json:"payload"` // 1 GB max payload
 }
 
 // Index is the Union[uint64, None] (For SSZ purposes)
@@ -183,62 +186,55 @@ func (m *ConstraintsMessage) MarshalSSZTo(buf []byte) (dst []byte, err error) {
 }
 
 func (m *ConstraintsMessage) SizeSSZ() int {
-	// At minimum, the size is 4 bytes of an offset to a dinamically sized object
-	// plus 16 bytes of the two uint64 fields
-	size := 20
-
-	// Field (2) 'Constraints'. We need to add the size of the constraints with their default values
-	for i := 0; i < len(m.Constraints); i++ {
-		// The offset to the transaction list
-		size += 4
-
-		size += len(m.Constraints[i].Tx)
-		size += m.Constraints[i].Index.SizeSSZ()
+	size := 48 + 48 + 8 + 4 + 4
+	for _, c := range m.Constraints {
+		size += 4 + c.SizeSSZ()
 	}
+	size += len(m.Receivers) * 48
 	return size
 }
 
-func (m *ConstraintsMessage) UnmarshalSSZ(buf []byte) (err error) {
-	size := uint64(len(buf))
-	if size < 20 {
-		// 8 + 8 + 4 bytes for the offset
+func (m *ConstraintsMessage) UnmarshalSSZ(buf []byte) error {
+	if len(buf) < 104 {
 		return ssz.ErrSize
 	}
+	o0 := ssz.ReadOffset(buf[104:108])
+	o1 := ssz.ReadOffset(buf[108:112])
 
-	tail := buf
-	var o2 uint64
+	copy(m.Proposer[:], buf[0:48])
+	copy(m.Delegate[:], buf[48:96])
+	m.Slot = binary.LittleEndian.Uint64(buf[96:104])
 
-	// Field (0) `ValidatorIndex`
-	m.ValidatorIndex = binary.LittleEndian.Uint64(buf[0:8])
-
-	// Field (1) `Slot`
-	m.Slot = binary.LittleEndian.Uint64(buf[8:16])
-
-	// Offset (2) 'Constraints'
-	if o2 = ssz.ReadOffset(buf[16:20]); o2 > size {
-		return ssz.ErrOffset
-	}
-	if o2 < 20 {
-		return ssz.ErrInvalidVariableOffset
-	}
-
-	// Field (2) `Constraints`
-	buf = tail[o2:]
-	// We first read the amount of offset values we have, by looking
-	// at how big is the first offset
-	var length int
-	if length, err = ssz.DecodeDynamicLength(buf, MAX_CONSTRAINTS_PER_SLOT); err != nil {
-		return
+	// Constraints
+	constraintsBuf := buf[o0:]
+	length, err := ssz.DecodeDynamicLength(constraintsBuf, MAX_CONSTRAINTS_PER_SLOT)
+	if err != nil {
+		return err
 	}
 	m.Constraints = make([]*Constraint, length)
-	err = ssz.UnmarshalDynamic(buf, length, func(indx int, buf []byte) (err error) {
-		if m.Constraints[indx] == nil {
-			m.Constraints[indx] = new(Constraint)
+	err = ssz.UnmarshalDynamic(constraintsBuf, length, func(i int, b []byte) error {
+		c := new(Constraint)
+		if err := c.UnmarshalSSZ(b); err != nil {
+			return err
 		}
-		return m.Constraints[indx].UnmarshalSSZ(buf)
+		m.Constraints[i] = c
+		return nil
 	})
+	if err != nil {
+		return err
+	}
 
-	return
+	// Receivers
+	receiversBuf := buf[o1:]
+	length, err = ssz.DecodeFixedLength(receiversBuf, 48, MAX_RECEIVERS)
+	if err != nil {
+		return err
+	}
+	m.Receivers = make([]phase0.BLSPubkey, length)
+	for i := range m.Receivers {
+		copy(m.Receivers[i][:], receiversBuf[i*48:(i+1)*48])
+	}
+	return nil
 }
 
 func (c *Constraint) MarshalSSZ() ([]byte, error) {
@@ -274,59 +270,21 @@ func (c *Constraint) MarshalSSZTo(buf []byte) (dst []byte, err error) {
 
 func (c *Constraint) SizeSSZ() int {
 	// Both fields are dynamically sized, so we start with two offsets of 4 bytes each
-	size := 8
-
-	// Field (0) 'Tx'.
-	size += len(c.Tx)
-
-	// Field (1) 'Index'.
-	size += c.Index.SizeSSZ()
-
-	return size
+	return 8 + 4 + len(c.Payload)
 }
 
 func (c *Constraint) UnmarshalSSZ(buf []byte) (err error) {
-	size := uint64(len(buf))
-	if size < 8 {
-		// It needs to contain at least 8 bytes for the two offsets
+	if len(buf) < 12 {
 		return ssz.ErrSize
 	}
-
-	tail := buf
-	var o0, o1 uint64
-
-	// Offset (0) 'Tx'
-	if o0 = ssz.ReadOffset(buf[0:4]); o0 > size {
-		return ssz.ErrOffset
-	}
-	if o0 < 8 {
+	c.ConstraintType = binary.LittleEndian.Uint64(buf[:8])
+	o0 := ssz.ReadOffset(buf[8:12])
+	if o0 > uint64(len(buf)) || o0 < 12 {
 		return ssz.ErrInvalidVariableOffset
 	}
-
-	// Offset (1) 'Index'
-	if o1 = ssz.ReadOffset(buf[4:8]); o1 > size || o0 > o1 {
-		return ssz.ErrOffset
-	}
-
-	// Field (0) `Tx`
-	buf = tail[o0:o1]
-	if len(buf) > MAX_BYTES_PER_TRANSACTION {
-		return ssz.ErrBytesLengthFn("Constraint.Tx", len(buf), MAX_BYTES_PER_TRANSACTION)
-	}
-	c.Tx = make([]byte, 0, len(buf))
-	c.Tx = append(c.Tx, buf...)
-
-	// Field (1) `Index`
-	buf = tail[o1:]
-	if buf[0] == 0 {
-		// Means it's a None value
-		c.Index = nil
-	} else {
-		c.Index = new(Index)
-		*(c.Index) = Index(binary.LittleEndian.Uint64(buf[1:]))
-	}
-
-	return
+	c.Payload = make([]byte, len(buf[o0:]))
+	copy(c.Payload, buf[o0:])
+	return nil
 }
 
 func (i *Index) SizeSSZ() int {
