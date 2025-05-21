@@ -1,15 +1,12 @@
 package api
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/attestantio/go-eth2-client/spec/phase0"
 	gethCommon "github.com/ethereum/go-ethereum/common"
-	fastSsz "github.com/ferranbt/fastssz"
-	"github.com/flashbots/mev-boost-relay/common"
-	"github.com/sirupsen/logrus"
 )
 
 var (
@@ -24,65 +21,76 @@ var (
 // verifyInclusionProof verifies the proofs against the constraints, and returns an error if the proofs are invalid.
 //
 // NOTE: assumes constraints transactions are already without blobs
-func verifyInclusionProof(log *logrus.Entry, transactionsRoot phase0.Root, proof *common.InclusionProof, hashToConstraints HashToConstraintDecoded) error {
-	if proof == nil {
-		return ErrNilProof
+func verifyInclusionProof(proofs []*Proof, constraints []*Constraint, root phase0.Hash32) error {
+	if len(proofs) == 0 {
+		return nil
 	}
 
-	if len(proof.TransactionHashes) != len(proof.GeneralizedIndexes) {
-		return ErrHashesIndexesMismatch
+	if len(proofs) != len(constraints) {
+		return fmt.Errorf("%w: got %d proofs and %d constraints", ErrHashesConstraintsMismatch, len(proofs), len(constraints))
 	}
 
-	if len(proof.TransactionHashes) != len(hashToConstraints) {
-		return ErrHashesIndexesMismatch
-	}
-
-	leaves := make([][]byte, len(hashToConstraints))
-	indexes := make([]int, len(proof.GeneralizedIndexes))
-
-	for i, hash := range proof.TransactionHashes {
-		constraint, ok := hashToConstraints[gethCommon.Hash(hash)]
-		if constraint == nil || !ok {
-			return ErrNilConstraint
+	// Verify each proof
+	for i, proof := range proofs {
+		if proof == nil {
+			return fmt.Errorf("%w: proof at index %d is nil", ErrNilProof, i)
 		}
 
-		// Compute the hash tree root for the raw preconfirmed transaction
-		// and use it as "Leaf" in the proof to be verified against
-		encoded, err := constraint.Tx.MarshalBinary()
+		// Calculate the leaf hash from the constraint
+		leaf, err := calculateLeafHash(constraints[i])
 		if err != nil {
-			log.WithError(err).Error("error marshalling transaction without blob tx sidecar")
-			return err
+			return fmt.Errorf("failed to calculate leaf hash: %w", err)
 		}
 
-		tx := Transaction(encoded)
-		txHashTreeRoot, err := tx.HashTreeRoot()
-		if err != nil {
-			return ErrInvalidRoot
+		// Verify the proof
+		if !verifyMerkleProof(leaf, proof.Path, proof.Index, root) {
+			return fmt.Errorf("%w: invalid proof at index %d", ErrInvalidProofs, i)
 		}
-
-		leaves[i] = txHashTreeRoot[:]
-		indexes[i] = int(proof.GeneralizedIndexes[i])
-		i++
-	}
-
-	hashes := make([][]byte, len(proof.MerkleHashes))
-	for i, hash := range proof.MerkleHashes {
-		hashes[i] = []byte(*hash)
-	}
-
-	currentTime := time.Now()
-	ok, err := fastSsz.VerifyMultiproof(transactionsRoot[:], hashes, leaves, indexes)
-	elapsed := time.Since(currentTime)
-	if err != nil {
-		log.WithError(err).Error("error verifying merkle proof")
-		return err
-	}
-
-	if !ok {
-		return ErrInvalidProofs
-	} else {
-		log.Info(fmt.Sprintf("[BOLT]: inclusion proof verified in %s", elapsed))
 	}
 
 	return nil
+}
+
+// calculateLeafHash calculates the hash of a constraint for the merkle tree
+func calculateLeafHash(constraint *Constraint) (phase0.Hash32, error) {
+	if constraint == nil {
+		return phase0.Hash32{}, ErrNilConstraint
+	}
+
+	// Calculate the hash of the transaction
+	txHash := gethCommon.BytesToHash(constraint.Tx)
+
+	// If there's an index, include it in the hash
+	if constraint.Index != nil {
+		// Combine tx hash and index into a single hash
+		combined := make([]byte, 40) // 32 bytes for tx hash + 8 bytes for index
+		copy(combined[:32], txHash[:])
+		binary.LittleEndian.PutUint64(combined[32:], uint64(*constraint.Index))
+		return phase0.Hash32(gethCommon.BytesToHash(combined)), nil
+	}
+
+	return phase0.Hash32(txHash), nil
+}
+
+// verifyMerkleProof verifies a merkle proof against a root
+func verifyMerkleProof(leaf phase0.Hash32, path []phase0.Hash32, index uint64, root phase0.Hash32) bool {
+	current := leaf
+	for i, sibling := range path {
+		if (index>>i)&1 == 0 {
+			// Current is left
+			current = hashPair(current, sibling)
+		} else {
+			// Current is right
+			current = hashPair(sibling, current)
+		}
+	}
+	return current == root
+}
+
+// hashPair combines two hashes into a single hash
+func hashPair(a, b phase0.Hash32) phase0.Hash32 {
+	combined := make([]byte, 64) // 32 bytes for each hash
+	copy(combined[:32], a[:])
+	copy(combined[32:], b[:])
+	return phase0.Hash32(gethCommon.BytesToHash(combined))
 }

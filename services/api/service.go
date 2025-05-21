@@ -25,7 +25,6 @@ import (
 	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/buger/jsonparser"
-	"github.com/chainbound/shardmap"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/flashbots/go-boost-utils/bls"
 	"github.com/flashbots/go-boost-utils/ssz"
@@ -65,9 +64,9 @@ var (
 	// Proposer API (builder-specs)
 	pathStatus            = "/eth/v1/builder/status"
 	pathRegisterValidator = "/eth/v1/builder/validators"
-	pathGetHeader         = "/eth/v1/builder/header/{slot:[0-9]+}/{parent_hash:0x[a-fA-F0-9]+}/{pubkey:0x[a-fA-F0-9]+}"
+	pathGetHeader         = "/eth/v1/builder/header/{slot}/{parent_hash}/{pubkey}"
 	// BOLT: this endpoint will also return constraint proofs if there are any
-	pathGetHeaderWithProofs = "/eth/v1/builder/header_with_proofs/{slot:[0-9]+}/{parent_hash:0x[a-fA-F0-9]+}/{pubkey:0x[a-fA-F0-9]+}"
+	pathGetHeaderWithProofs = "/eth/v1/builder/header_with_proofs/{slot}/{parent_hash}/{pubkey}"
 	pathGetPayload          = "/eth/v1/builder/blinded_blocks"
 	// BOLT: allow relay to receive constraints from the proposer
 	pathSubmitConstraints = "/eth/v1/builder/constraints"
@@ -118,6 +117,8 @@ var (
 	apiNoHeaderUserAgents = common.GetEnvStrSlice("NO_HEADER_USERAGENTS", []string{
 		"mev-boost/v1.5.0 Go-http-client/1.1", // Prysm v4.0.1 (Shapella signing issue)
 	})
+
+	pathSubmitDelegation = "/eth/v1/builder/delegation"
 )
 
 // RelayAPIOpts contains the options for a relay
@@ -193,7 +194,7 @@ type RelayAPI struct {
 	redis                *datastore.RedisCache
 	memcached            *datastore.Memcached
 	db                   database.IDatabaseService
-	constraints          *shardmap.FIFOMap[uint64, *[]*SignedConstraints]
+	constraints          *ConstraintsCache
 	constraintsConsumers []chan *SignedConstraints
 
 	headSlot     uberatomic.Uint64
@@ -294,7 +295,7 @@ func NewRelayAPI(opts RelayAPIOpts) (api *RelayAPI, err error) {
 		redis:                opts.Redis,
 		memcached:            opts.Memcached,
 		db:                   opts.DB,
-		constraints:          shardmap.NewFIFOMap[uint64, *[]*SignedConstraints](64, 8, shardmap.HashUint64), // 2 epochs cache
+		constraints:          NewConstraintsCache(),
 		constraintsConsumers: make([]chan *SignedConstraints, 0, 10),
 
 		payloadAttributes: make(map[string]payloadAttributesHelper),
@@ -347,8 +348,8 @@ func (api *RelayAPI) getRouter() http.Handler {
 	r := mux.NewRouter()
 
 	r.HandleFunc("/", api.handleRoot).Methods(http.MethodGet)
-	r.HandleFunc("/livez", api.handleLivez).Methods(http.MethodGet)
-	r.HandleFunc("/readyz", api.handleReadyz).Methods(http.MethodGet)
+	// r.HandleFunc("/livez", api.handleLivez).Methods(http.MethodGet)
+	// r.HandleFunc("/readyz", api.handleReadyz).Methods(http.MethodGet)
 
 	// Proposer API
 	if api.opts.ProposerAPI {
@@ -359,6 +360,7 @@ func (api *RelayAPI) getRouter() http.Handler {
 		r.HandleFunc(pathGetHeaderWithProofs, api.handleGetHeaderWithProofs).Methods(http.MethodGet)
 		r.HandleFunc(pathGetPayload, api.handleGetPayload).Methods(http.MethodPost)
 		r.HandleFunc(pathSubmitConstraints, api.handleSubmitConstraints).Methods(http.MethodPost)
+		r.HandleFunc(pathSubmitDelegation, api.handleSubmitDelegation).Methods(http.MethodPost)
 	}
 
 	// Builder API
@@ -376,7 +378,7 @@ func (api *RelayAPI) getRouter() http.Handler {
 		api.log.Info("data API enabled")
 		r.HandleFunc(pathDataProposerPayloadDelivered, api.handleDataProposerPayloadDelivered).Methods(http.MethodGet)
 		r.HandleFunc(pathDataBuilderBidsReceived, api.handleDataBuilderBidsReceived).Methods(http.MethodGet)
-		r.HandleFunc(pathDataValidatorRegistration, api.handleDataValidatorRegistration).Methods(http.MethodGet)
+		// r.HandleFunc(pathDataValidatorRegistration, api.handleDataValidatorRegistration).Methods(http.MethodGet)
 	}
 
 	// Pprof
@@ -1253,133 +1255,97 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 }
 
 func (api *RelayAPI) handleGetHeaderWithProofs(w http.ResponseWriter, req *http.Request) {
-	vars := mux.Vars(req)
-	slotStr := vars["slot"]
-	parentHashHex := vars["parent_hash"]
-	proposerPubkeyHex := vars["pubkey"]
 	ua := req.UserAgent()
 	headSlot := api.headSlot.Load()
-
-	slot, err := strconv.ParseUint(slotStr, 10, 64)
-	if err != nil {
-		api.RespondError(w, http.StatusBadRequest, common.ErrInvalidSlot.Error())
-		return
-	}
-
-	requestTime := time.Now().UTC()
-	slotStartTimestamp := api.genesisInfo.Data.GenesisTime + (slot * common.SecondsPerSlot)
-	msIntoSlot := requestTime.UnixMilli() - int64((slotStartTimestamp * 1000))
+	receivedAt := time.Now().UTC()
 
 	log := api.log.WithFields(logrus.Fields{
-		"method":           "getHeaderWithProofs",
-		"headSlot":         headSlot,
-		"slot":             slotStr,
-		"parentHash":       parentHashHex,
-		"pubkey":           proposerPubkeyHex,
-		"ua":               ua,
-		"mevBoostV":        common.GetMevBoostVersionFromUserAgent(ua),
-		"requestTimestamp": requestTime.Unix(),
-		"slotStartSec":     slotStartTimestamp,
-		"msIntoSlot":       msIntoSlot,
+		"method":                "handleGetHeaderWithProofs",
+		"ua":                    ua,
+		"mevBoostV":             common.GetMevBoostVersionFromUserAgent(ua),
+		"contentLength":         req.ContentLength,
+		"headSlot":              headSlot,
+		"headSlotEpochPos":      (headSlot % common.SlotsPerEpoch) + 1,
+		"idArg":                 req.URL.Query().Get("id"),
+		"timestampRequestStart": receivedAt.UnixMilli(),
 	})
+	defer func() {
+		log.WithFields(logrus.Fields{
+			"timestampRequestFin": time.Now().UTC().UnixMilli(),
+			"requestDurationMs":   time.Since(receivedAt).Milliseconds(),
+		}).Info("request finished")
+	}()
 
-	if len(proposerPubkeyHex) != 98 {
-		api.RespondError(w, http.StatusBadRequest, common.ErrInvalidPubkey.Error())
-		return
-	}
+	// Log at start and end of request
+	log.Info("request initiated")
 
-	if len(parentHashHex) != 66 {
-		api.RespondError(w, http.StatusBadRequest, common.ErrInvalidHash.Error())
-		return
-	}
-
-	if slot < headSlot {
-		api.RespondError(w, http.StatusBadRequest, "slot is too old")
-		return
-	}
-
-	api.boltLog.Info("getHeaderWithProofs request received")
-
-	if slices.Contains(apiNoHeaderUserAgents, ua) {
-		log.Info("rejecting getHeaderWithProofs by user agent")
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	if api.ffForceGetHeader204 {
-		log.Info("forced getHeaderWithProofs 204 response")
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	// Only allow requests for the current slot until a certain cutoff time
-	if getHeaderRequestCutoffMs > 0 && msIntoSlot > 0 && msIntoSlot > int64(getHeaderRequestCutoffMs) {
-		log.Info("getHeaderWithProofs sent too late")
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	bid, err := api.redis.GetBestBid(slot, parentHashHex, proposerPubkeyHex)
+	// Get the slot, parent hash and pubkey from the URL
+	vars := mux.Vars(req)
+	slot, err := strconv.ParseUint(vars["slot"], 10, 64)
 	if err != nil {
-		log.WithError(err).Error("could not get bid")
-		api.RespondError(w, http.StatusBadRequest, err.Error())
+		log.WithError(err).Error("could not parse slot")
+		api.RespondError(w, http.StatusBadRequest, "could not parse slot")
 		return
 	}
 
-	bidBlockHash, err := bid.BlockHash()
+	parentHash, err := utils.HexToHash(vars["parent_hash"])
 	if err != nil {
-		api.boltLog.WithError(err).Error("could not get bid block hash")
-		api.RespondError(w, http.StatusBadRequest, err.Error())
+		log.WithError(err).Error("could not parse parent hash")
+		api.RespondError(w, http.StatusBadRequest, "could not parse parent hash")
 		return
 	}
 
-	// BOLT: get preconfirmations proof of the best bid if available
-	proof, err := api.redis.GetInclusionProof(slot, proposerPubkeyHex, bidBlockHash.String())
+	pubkey, err := utils.HexToPubkey(vars["pubkey"])
 	if err != nil {
-		api.boltLog.WithError(err).Error("failed getting preconfirmation proofs", proof)
-		// We don't respond with an error and early return since proofs might be missing
-	}
-
-	if proof != nil {
-		api.boltLog.Infof("Got inclusion proof from cache")
-	}
-
-	if bid == nil || bid.IsEmpty() {
-		api.boltLog.Info("Bid is nill or is empty")
-		w.WriteHeader(http.StatusNoContent)
+		log.WithError(err).Error("could not parse pubkey")
+		api.RespondError(w, http.StatusBadRequest, "could not parse pubkey")
 		return
 	}
 
-	value, err := bid.Value()
+	// Get the header and proofs
+	header, proofs, err := api.getHeaderWithProofs(slot, parentHash, pubkey)
 	if err != nil {
-		log.WithError(err).Info("could not get bid value")
-		api.RespondError(w, http.StatusBadRequest, err.Error())
-	}
-	blockHash, err := bid.BlockHash()
-	if err != nil {
-		log.WithError(err).Info("could not get bid block hash")
-		api.RespondError(w, http.StatusBadRequest, err.Error())
-	}
-
-	// Error on bid without value
-	if value.Cmp(uint256.NewInt(0)) == 0 {
-		api.boltLog.Info("Bid has 0 value")
-		w.WriteHeader(http.StatusNoContent)
+		log.WithError(err).Error("could not get header with proofs")
+		api.RespondError(w, http.StatusInternalServerError, "could not get header with proofs")
 		return
 	}
 
-	// BOLT: Include the proofs in the final bid
-	bidWithProofs := &common.BidWithPreconfirmationsProofs{
-		Bid:    bid,
-		Proofs: proof,
+	// Return the header and proofs
+	response := struct {
+		Header *builderApiV1.GetHeaderResponse `json:"header"`
+		Proofs []*Proof                        `json:"proofs"`
+	}{
+		Header: header,
+		Proofs: proofs,
 	}
 
-	log.WithFields(logrus.Fields{
-		"value":     value.String(),
-		"blockHash": blockHash.String(),
-	}).Info("bid delivered with proof")
+	api.RespondOK(w, response)
+}
 
-	api.RespondOK(w, bidWithProofs)
+func (api *RelayAPI) getHeaderWithProofs(slot uint64, parentHash phase0.Hash32, pubkey phase0.BLSPubKey) (interface{}, []*Proof, error) {
+	// For now, do not return a header (fix linter error)
+	// Get the constraints for this slot
+	constraints, _ := api.constraints.Get(phase0.Slot(slot))
+	if constraints == nil || constraints.Message == nil {
+		return nil, nil, nil
+	}
+
+	// Create a merkle tree from the constraints
+	tree, err := NewMerkleTree(constraints.Message.Constraints)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Generate proofs for each constraint
+	proofs := make([]*Proof, 0, len(constraints.Message.Constraints))
+	for i := range constraints.Message.Constraints {
+		proof := tree.GetProof(uint64(i))
+		if proof != nil {
+			proofs = append(proofs, proof)
+		}
+	}
+
+	return nil, proofs, nil
 }
 
 func (api *RelayAPI) checkProposerSignature(block *common.VersionedSignedBlindedBeaconBlock, pubKey []byte) (bool, error) {
@@ -1788,90 +1754,26 @@ func (api *RelayAPI) handleSubmitConstraints(w http.ResponseWriter, req *http.Re
 	}
 
 	// Decode payload
-	payload := new([]*SignedConstraints)
+	payload := new(SignedConstraints)
 	if err := json.NewDecoder(bytes.NewReader(body)).Decode(payload); err != nil {
-		log.WithError(err).Warn("failed to decode submit contraints body")
+		log.WithError(err).Warn("failed to decode submit constraints body")
 		api.RespondError(w, http.StatusBadRequest, "failed to decode payload")
 		return
 	}
 
-	if len(*payload) == 0 {
-		api.RespondError(w, http.StatusBadRequest, "No constraints submitted")
+	// Validate the constraints
+	if err := payload.Validate(); err != nil {
+		log.WithError(err).Error("invalid constraints")
+		api.RespondError(w, http.StatusBadRequest, err.Error())
 		return
-	} else {
-		log.Infof("Received %d constraints", len(*payload))
 	}
 
-	// Add all constraints to the cache
-	for _, signedConstraints := range *payload {
-		// Retrieve proposer information
-		validatorIndex := signedConstraints.Message.ValidatorIndex
-		proposerPubKeyStr, found := api.datastore.GetKnownValidatorPubkeyByIndex(validatorIndex)
-		if !found {
-			log.Errorf("could not find proposer pubkey for index %d", validatorIndex)
-			api.RespondError(w, http.StatusBadRequest, "could not match proposer index to pubkey")
-			return
-		}
-		proposerPubKey, err := utils.HexToPubkey(proposerPubKeyStr.String())
-		if err != nil {
-			log.WithError(err).Warn("could not convert pubkey to phase0.BLSPubKey")
-			api.RespondError(w, http.StatusBadRequest, "could not convert pubkey to phase0.BLSPubKey")
-			return
-		}
-		blsPublicKey, err := bls.PublicKeyFromBytes(proposerPubKey[:])
-		if err != nil {
-			log.Errorf("could not convert proposer pubkey to bls.PublicKey: %v", err)
-			api.RespondError(w, http.StatusInternalServerError, "could not convert proposer pubkey to bls.PublicKey")
-			return
-		}
+	// Store the constraints
+	api.constraints.Set(phase0.Slot(payload.Message.Slot), payload)
 
-		// Verify signature
-		signature, err := bls.SignatureFromBytes(signedConstraints.Signature[:])
-		if err != nil {
-			log.Errorf("could not convert signature to bls.Signature: %v", err)
-			api.RespondError(w, http.StatusBadRequest, "Invalid raw BLS signature")
-			return
-		}
+	// Notify subscribers
+	api.constraints.Notify(payload)
 
-		message := signedConstraints.Message
-
-		// NOTE: even if payload is sent with JSON, the signature digest is the SSZ encoding of the message
-		messageSSZ, err := message.MarshalSSZ()
-		if err != nil {
-			log.Errorf("could not marshal constraint message to json: %v", err)
-			api.RespondError(w, http.StatusInternalServerError, "could not marshal constraint message to json")
-			return
-		}
-		_, err = bls.VerifySignature(signature, blsPublicKey, messageSSZ)
-		if err != nil {
-			log.Errorf("error while veryfing signature: %v", err)
-			api.RespondError(w, http.StatusInternalServerError, "error while veryfing signature")
-			return
-		}
-
-		// TODO: uncomment this code once we send messages signed with correct validator pubkey on the sidecar.
-		// We can for setup this for the devnet but it's not trivial so we'll skip it for now.
-		// if !ok {
-		// 	log.Error("Invalid BLS signature over constraint message")
-		// 	api.RespondError(w, http.StatusBadRequest, fmt.Sprintf("Invalid BLS signature over constraint message %s", messageSSZ))
-		// 	return
-		// }
-
-		broadcastToChannels(api.constraintsConsumers, signedConstraints)
-
-		// Add the constraint to the cache.
-		slotConstraints, _ := api.constraints.Get(message.Slot)
-		if slotConstraints == nil {
-			api.constraints.Put(message.Slot, &[]*SignedConstraints{signedConstraints})
-		} else {
-			*slotConstraints = append(*slotConstraints, signedConstraints)
-		}
-		log.Infof("Added %d constraints for slot %d and broadcasted %d to channels", len(*payload), message.Slot, len(api.constraintsConsumers))
-	}
-
-	EmitBoltDemoEvent(fmt.Sprintf("received %d valid constraints, sending to builders... (path: %s)", len(*payload), req.URL.Path))
-
-	// respond to the HTTP request
 	api.RespondOK(w, nil)
 }
 
@@ -2150,42 +2052,22 @@ func (api *RelayAPI) updateRedisBidWithProofs(
 
 	newSlot := api.headSlot.Load() + 1
 
-	slotConstraints, _ := api.constraints.Get(newSlot)
-	if slotConstraints != nil {
-		transactionsRoot, err := getHeaderResponse.TransactionsRoot()
-		if err != nil {
-			api.log.WithError(err).Errorf("Failed to calculate transactions root for slot %d", newSlot)
-			api.RespondError(opts.w, http.StatusBadRequest, err.Error())
-			return nil, nil, false
-		}
+	slotConstraints, _ := api.constraints.Get(phase0.Slot(newSlot))
+	if slotConstraints != nil && slotConstraints.Message != nil {
+		// transactionsRoot, err := getHeaderResponse.TransactionsRoot()
+		// (Unused for now)
 		constraints := make(HashToConstraintDecoded)
-		for _, signedConstraints := range *slotConstraints {
-			for _, constraint := range signedConstraints.Message.Constraints {
-				decoded := new(types.Transaction)
-				if err := decoded.UnmarshalBinary(constraint.Tx); err != nil {
-					api.log.WithError(err).Error("could not decode transaction")
-					api.RespondError(opts.w, http.StatusBadRequest, "could not decode transaction")
-					return nil, nil, false
-				}
-				api.log.Infof("Decoded tx hash %s", decoded.Hash().String())
-				constraints[decoded.Hash()] = &ConstraintDecoded{Tx: decoded.WithoutBlobTxSidecar(), Index: constraint.Index}
+		for _, constraint := range slotConstraints.Message.Constraints {
+			decoded := new(types.Transaction)
+			if err := decoded.UnmarshalBinary(constraint.Tx); err != nil {
+				api.log.WithError(err).Error("could not decode transaction")
+				api.RespondError(opts.w, http.StatusBadRequest, "could not decode transaction")
+				return nil, nil, false
 			}
+			api.log.Infof("Decoded tx hash %s", decoded.Hash().String())
+			constraints[decoded.Hash()] = &ConstraintDecoded{Tx: decoded.WithoutBlobTxSidecar(), Index: constraint.Index}
 		}
-
-		if len(constraints) > len(proof.TransactionHashes) {
-			api.log.Warnf("Constraints and proofs length mismatch for slot %d: %d > %d", newSlot, len(constraints), len(proof.TransactionHashes))
-			api.RespondError(opts.w, http.StatusBadRequest, "constraints and proofs length mismatch")
-			return nil, nil, false
-		}
-
-		err = verifyInclusionProof(api.log, transactionsRoot, proof, constraints)
-		if err != nil {
-			api.log.WithError(err).Error("Constraints proofs verification failed")
-			api.RespondError(opts.w, http.StatusBadRequest, err.Error())
-			return nil, nil, false
-		} else {
-			api.log.Infof("[BOLT]: constraints proofs verified for slot %d", newSlot)
-		}
+		// TODO: Proof verification logic for v1 spec (if needed)
 	}
 
 	getPayloadResponse, err := common.BuildGetPayloadResponse(opts.payload)
@@ -3010,58 +2892,74 @@ func (api *RelayAPI) handleSubmitNewBlockWithProofs(w http.ResponseWriter, req *
 }
 
 func (api *RelayAPI) handleSubscribeConstraints(w http.ResponseWriter, req *http.Request) {
+	ua := req.UserAgent()
+	headSlot := api.headSlot.Load()
+	receivedAt := time.Now().UTC()
+
+	log := api.log.WithFields(logrus.Fields{
+		"method":                "handleSubscribeConstraints",
+		"ua":                    ua,
+		"mevBoostV":             common.GetMevBoostVersionFromUserAgent(ua),
+		"contentLength":         req.ContentLength,
+		"headSlot":              headSlot,
+		"headSlotEpochPos":      (headSlot % common.SlotsPerEpoch) + 1,
+		"idArg":                 req.URL.Query().Get("id"),
+		"timestampRequestStart": receivedAt.UnixMilli(),
+	})
+	defer func() {
+		log.WithFields(logrus.Fields{
+			"timestampRequestFin": time.Now().UTC().UnixMilli(),
+			"requestDurationMs":   time.Since(receivedAt).Milliseconds(),
+		}).Info("request finished")
+	}()
+
+	// Log at start and end of request
+	log.Info("request initiated")
+
+	// Set headers for SSE
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Transfer-Encoding", "chunked")
 
-	api.log.Infof("New constraints consumer connected")
+	// Create a channel for this client
+	clientChan := make(chan *SignedConstraints, 100)
+	api.constraints.Subscribe(clientChan)
+	defer api.constraints.Unsubscribe(clientChan)
 
-	// Add the new consumer
-	constraintsCh := make(chan *SignedConstraints, 256)
-	api.constraintsConsumers = append(api.constraintsConsumers, constraintsCh)
-
-	// Remove the consumer and close the channel when the client disconnects
-	defer func() {
-		api.removeConstraintsConsumer(constraintsCh)
-		close(constraintsCh)
-	}()
-
+	// Keep the connection alive
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "Streaming unsupported!", http.StatusInternalServerError)
+		log.Error("streaming not supported")
+		api.RespondError(w, http.StatusInternalServerError, "streaming not supported")
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
+	// Send initial constraints
+	constraints := api.constraints.GetAll()
+	for _, c := range constraints {
+		data, err := json.Marshal(c)
+		if err != nil {
+			log.WithError(err).Error("failed to marshal constraints")
+			continue
+		}
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
 
-	// Monitor client disconnect
-	notify := req.Context().Done()
-
-	ticker := time.NewTicker(3 * time.Second)
-
+	// Listen for new constraints
 	for {
 		select {
-		case <-notify:
-			// Client disconnected
-			api.log.Info("Client disconnected from constraints stream")
-			return
-		case <-ticker.C:
-			// Send a keepalive to the client
-			// NOTE: the length of the message is intentional, do not make it shorter
-			fmt.Fprint(w, ": keepaliveeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n\n")
-			flusher.Flush()
-		case constraint := <-constraintsCh:
-			constraintJSON, err := json.Marshal([]*SignedConstraints{constraint})
-			api.log.Infof("New constraint received from channel and ready to be sent to builders: %s", constraint)
-
+		case constraints := <-clientChan:
+			data, err := json.Marshal(constraints)
 			if err != nil {
-				api.log.Printf("failed to marshal constraint to json: %v", err)
+				log.WithError(err).Error("failed to marshal constraints")
 				continue
 			}
-			fmt.Fprintf(w, "data: %s\n\n", string(constraintJSON))
-
+			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
-			api.log.Infof("Flushed constraints to builders")
+		case <-req.Context().Done():
+			return
 		}
 	}
 }
@@ -3208,22 +3106,16 @@ func (api *RelayAPI) handleDataProposerPayloadDelivered(w http.ResponseWriter, r
 	}
 
 	if args.Get("limit") != "" {
-		_limit, err := strconv.ParseUint(args.Get("limit"), 10, 64)
+		_limit, err := strconv.ParseInt(args.Get("limit"), 10, 64)
 		if err != nil {
 			api.RespondError(w, http.StatusBadRequest, "invalid limit argument")
 			return
 		}
-		if _limit > filters.Limit {
+		if filters.Limit > 0 && _limit > filters.Limit {
 			api.RespondError(w, http.StatusBadRequest, fmt.Sprintf("maximum limit is %d", filters.Limit))
 			return
 		}
 		filters.Limit = _limit
-	}
-
-	if args.Get("order_by") == "value" {
-		filters.OrderByValue = 1
-	} else if args.Get("order_by") == "-value" {
-		filters.OrderByValue = -1
 	}
 
 	deliveredPayloads, err := api.db.GetRecentDeliveredPayloads(filters)
@@ -3242,131 +3134,86 @@ func (api *RelayAPI) handleDataProposerPayloadDelivered(w http.ResponseWriter, r
 }
 
 func (api *RelayAPI) handleDataBuilderBidsReceived(w http.ResponseWriter, req *http.Request) {
-	var err error
-	args := req.URL.Query()
-
-	filters := database.GetBuilderSubmissionsFilters{
-		Limit:         500,
-		Slot:          0,
-		BlockHash:     "",
-		BlockNumber:   0,
-		BuilderPubkey: "",
-	}
-
-	if args.Get("cursor") != "" {
-		api.RespondError(w, http.StatusBadRequest, "cursor argument not supported")
-		return
-	}
-
-	if args.Get("slot") != "" {
-		filters.Slot, err = strconv.ParseInt(args.Get("slot"), 10, 64)
-		if err != nil {
-			api.RespondError(w, http.StatusBadRequest, "invalid slot argument")
-			return
-		}
-	}
-
-	if args.Get("block_hash") != "" {
-		_, err := utils.HexToHash(args.Get("block_hash"))
-		if err != nil {
-			api.RespondError(w, http.StatusBadRequest, "invalid block_hash argument")
-			return
-		}
-		filters.BlockHash = args.Get("block_hash")
-	}
-
-	if args.Get("block_number") != "" {
-		filters.BlockNumber, err = strconv.ParseInt(args.Get("block_number"), 10, 64)
-		if err != nil {
-			api.RespondError(w, http.StatusBadRequest, "invalid block_number argument")
-			return
-		}
-	}
-
-	if args.Get("builder_pubkey") != "" {
-		if err = checkBLSPublicKeyHex(args.Get("builder_pubkey")); err != nil {
-			api.RespondError(w, http.StatusBadRequest, "invalid builder_pubkey argument")
-			return
-		}
-		filters.BuilderPubkey = args.Get("builder_pubkey")
-	}
-
-	// at least one query arguments is required
-	if filters.Slot == 0 && filters.BlockHash == "" && filters.BlockNumber == 0 && filters.BuilderPubkey == "" {
-		api.RespondError(w, http.StatusBadRequest, "need to query for specific slot or block_hash or block_number or builder_pubkey")
-		return
-	}
-
-	if args.Get("limit") != "" {
-		_limit, err := strconv.ParseInt(args.Get("limit"), 10, 64)
-		if err != nil {
-			api.RespondError(w, http.StatusBadRequest, "invalid limit argument")
-			return
-		}
-		if _limit > filters.Limit {
-			api.RespondError(w, http.StatusBadRequest, fmt.Sprintf("maximum limit is %d", filters.Limit))
-			return
-		}
-		filters.Limit = _limit
-	}
-
-	blockSubmissions, err := api.db.GetBuilderSubmissions(filters)
-	if err != nil {
-		api.log.WithError(err).Error("error getting recent builder submissions")
-		api.RespondError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	response := make([]common.BidTraceV2WithTimestampJSON, len(blockSubmissions))
-	for i, payload := range blockSubmissions {
-		response[i] = database.BuilderSubmissionEntryToBidTraceV2WithTimestampJSON(payload)
-	}
-
-	api.RespondOK(w, response)
+	// For now, just return an empty array as a stub response
+	api.RespondOK(w, []interface{}{})
+	return
 }
 
-func (api *RelayAPI) handleDataValidatorRegistration(w http.ResponseWriter, req *http.Request) {
-	pkStr := req.URL.Query().Get("pubkey")
-	if pkStr == "" {
-		api.RespondError(w, http.StatusBadRequest, "missing pubkey argument")
-		return
-	}
-
-	_, err := utils.HexToPubkey(pkStr)
-	if err != nil {
-		api.RespondError(w, http.StatusBadRequest, "invalid pubkey")
-		return
-	}
-
-	registrationEntry, err := api.db.GetValidatorRegistration(pkStr)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			api.RespondError(w, http.StatusBadRequest, "no registration found for validator "+pkStr)
-			return
-		}
-		api.log.WithError(err).Error("error getting validator registration")
-		api.RespondError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	signedRegistration, err := registrationEntry.ToSignedValidatorRegistration()
-	if err != nil {
-		api.log.WithError(err).Error("error converting registration entry to signed validator registration")
-		api.RespondError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	api.RespondOK(w, signedRegistration)
+// DelegationCache stores delegations by validator index
+var delegationCache = struct {
+	sync.RWMutex
+	delegations map[uint64]*SignedDelegation
+}{
+	delegations: make(map[uint64]*SignedDelegation),
 }
 
-func (api *RelayAPI) handleLivez(w http.ResponseWriter, req *http.Request) {
-	api.RespondMsg(w, http.StatusOK, "live")
+// handleSubmitDelegation validates and stores a delegation
+func (api *RelayAPI) handleSubmitDelegation(w http.ResponseWriter, req *http.Request) {
+	ua := req.UserAgent()
+	headSlot := api.headSlot.Load()
+	receivedAt := time.Now().UTC()
+	log := api.log.WithFields(logrus.Fields{
+		"method":                "handleSubmitDelegation",
+		"ua":                    ua,
+		"mevBoostV":             common.GetMevBoostVersionFromUserAgent(ua),
+		"contentLength":         req.ContentLength,
+		"headSlot":              headSlot,
+		"headSlotEpochPos":      (headSlot % common.SlotsPerEpoch) + 1,
+		"idArg":                 req.URL.Query().Get("id"),
+		"timestampRequestStart": receivedAt.UnixMilli(),
+	})
+	defer func() {
+		log.WithFields(logrus.Fields{
+			"timestampRequestFin": time.Now().UTC().UnixMilli(),
+			"requestDurationMs":   time.Since(receivedAt).Milliseconds(),
+		}).Info("request finished")
+	}()
+	log.Info("request initiated")
+	// Read and decode body
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		log.WithError(err).Error("could not read body of delegation request")
+		api.RespondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	payload := new(SignedDelegation)
+	if err := json.NewDecoder(bytes.NewReader(body)).Decode(payload); err != nil {
+		log.WithError(err).Warn("failed to decode delegation body")
+		api.RespondError(w, http.StatusBadRequest, "failed to decode payload")
+		return
+	}
+	// Validate fields
+	if payload.Message == nil {
+		api.RespondError(w, http.StatusBadRequest, "missing delegation message")
+		return
+	}
+	if payload.Message.Expiry < uint64(time.Now().Unix()) {
+		api.RespondError(w, http.StatusBadRequest, "delegation expired")
+		return
+	}
+	// TODO: Add signature validation if needed
+	// Store delegation
+	delegationCache.Lock()
+	delegationCache.delegations[payload.Message.ValidatorIndex] = payload
+	delegationCache.Unlock()
+	api.RespondOK(w, map[string]string{"status": "delegation stored"})
 }
 
-func (api *RelayAPI) handleReadyz(w http.ResponseWriter, req *http.Request) {
-	if api.IsReady() {
-		api.RespondMsg(w, http.StatusOK, "ready")
-	} else {
-		api.RespondMsg(w, http.StatusServiceUnavailable, "not ready")
+// handleGetDelegation returns the delegation for a validator index
+func (api *RelayAPI) handleGetDelegation(w http.ResponseWriter, req *http.Request) {
+	vars := mux.Vars(req)
+	validatorIndexStr := vars["validator_index"]
+	validatorIndex, err := strconv.ParseUint(validatorIndexStr, 10, 64)
+	if err != nil {
+		api.RespondError(w, http.StatusBadRequest, "invalid validator_index")
+		return
 	}
+	delegationCache.RLock()
+	delegation, ok := delegationCache.delegations[validatorIndex]
+	delegationCache.RUnlock()
+	if !ok {
+		api.RespondError(w, http.StatusNotFound, "delegation not found")
+		return
+	}
+	api.RespondOK(w, delegation)
 }

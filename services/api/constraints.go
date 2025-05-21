@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/binary"
+	"sync"
 
 	"github.com/attestantio/go-eth2-client/spec/phase0"
 	ssz "github.com/ferranbt/fastssz"
@@ -65,6 +66,27 @@ type ConstraintsMap = map[phase0.Hash32]*Constraint
 type ConstraintCache struct {
 	// map of slots to constraints
 	constraints map[uint64]ConstraintsMap
+}
+
+// Proof represents a merkle proof for a constraint
+type Proof struct {
+	Leaf  phase0.Hash32   `json:"leaf"`
+	Path  []phase0.Hash32 `json:"path"`
+	Index uint64          `json:"index"`
+}
+
+// SignedProof represents a signed merkle proof
+type SignedProof struct {
+	Message   *Proof              `json:"message"`
+	Signature phase0.BLSSignature `ssz-size:"96" json:"signature"`
+}
+
+func (p *Proof) String() string {
+	return JSONStringify(p)
+}
+
+func (p *SignedProof) String() string {
+	return JSONStringify(p)
 }
 
 func (c *SignedConstraints) MarshalSSZ() ([]byte, error) {
@@ -335,4 +357,91 @@ func (i *Index) SizeSSZ() int {
 	}
 	// selector + uint64
 	return 9
+}
+
+type ConstraintsCache struct {
+	mu          sync.RWMutex
+	constraints map[phase0.Slot]*SignedConstraints
+	subscribers []chan *SignedConstraints
+}
+
+func NewConstraintsCache() *ConstraintsCache {
+	return &ConstraintsCache{
+		constraints: make(map[phase0.Slot]*SignedConstraints),
+		subscribers: make([]chan *SignedConstraints, 0),
+	}
+}
+
+func (c *ConstraintsCache) Get(slot phase0.Slot) (*SignedConstraints, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	constraints, ok := c.constraints[slot]
+	return constraints, ok
+}
+
+func (c *ConstraintsCache) Set(slot phase0.Slot, constraints *SignedConstraints) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.constraints[slot] = constraints
+}
+
+func (c *ConstraintsCache) GetAll() []*SignedConstraints {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	constraints := make([]*SignedConstraints, 0, len(c.constraints))
+	for _, c := range c.constraints {
+		constraints = append(constraints, c)
+	}
+	return constraints
+}
+
+func (c *ConstraintsCache) Subscribe(ch chan *SignedConstraints) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.subscribers = append(c.subscribers, ch)
+}
+
+func (c *ConstraintsCache) Unsubscribe(ch chan *SignedConstraints) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i, subscriber := range c.subscribers {
+		if subscriber == ch {
+			c.subscribers = append(c.subscribers[:i], c.subscribers[i+1:]...)
+			return
+		}
+	}
+}
+
+func (c *ConstraintsCache) Notify(constraints *SignedConstraints) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, ch := range c.subscribers {
+		select {
+		case ch <- constraints:
+		default:
+			// Skip if channel is full
+		}
+	}
+}
+
+// Delegation and SignedDelegation types for v1 constraints spec
+
+type Delegation struct {
+	ValidatorIndex uint64   `json:"validator_index"`
+	Slot           uint64   `json:"slot"`
+	Gateway        [48]byte `json:"gateway"` // BLS pubkey
+	Expiry         uint64   `json:"expiry"`
+}
+
+type SignedDelegation struct {
+	Message   *Delegation         `json:"message"`
+	Signature phase0.BLSSignature `ssz-size:"96" json:"signature"`
+}
+
+func (d Delegation) String() string {
+	return JSONStringify(d)
+}
+
+func (d SignedDelegation) String() string {
+	return JSONStringify(d)
 }
